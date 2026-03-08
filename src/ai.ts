@@ -4,133 +4,204 @@ import path from 'path';
 import { TARGET_REPO_PATH } from './config.js';
 import { agentTools, readFile, searchProject } from './tools.js';
 
-export interface GeneratedFile { filepath: string; code: string; }
-export interface AIResponse { targetRoute: string; commitMessage: string; files: GeneratedFile[]; }
+export interface FileEdit {
+  filepath: string;
+  search: string;
+  replace: string;
+}
+
+export interface AIResponse {
+  targetRoute: string;
+  commitMessage: string;
+  edits: FileEdit[];
+}
+
+const REPO_PATTERNS = `
+REPOSITORY OVERVIEW
+- Monorepos structure: frontends (expo) and backends (nest/api).
+- Single repos: standard expo app.
+
+FRONTEND PATTERNS (Expo)
+- Routes live in app/.
+- Reuse UI blocks from components/ui.
+- Use theme tokens from theme/index.ts.
+
+BACKEND PATTERNS (NestJS)
+- Keep domain structure: module + controller + service + schema + dto.
+
+DELIVERY RULES
+- Do minimal edits.
+- Use "search" and "replace" blocks to patch files. The "search" string MUST perfectly match existing code.
+`;
+
+function buildSystemPrompt(userPrompt: string, figmaData: string | null, projectTree: string): string {
+  const figmaInstructions = figmaData ? `FIGMA JSON CONTEXT:\n${figmaData}` : 'FIGMA JSON CONTEXT: (none)';
+
+  return `
+You are Jarvis, a senior autonomous software architect.
+
+PROJECT TREE
+${projectTree || '(empty)'}
+
+${REPO_PATTERNS}
+${figmaInstructions}
+
+USER OBJECTIVE
+"${userPrompt}"
+
+TOOL USAGE CONTRACT
+1) Inspect files with 'read_file' before editing.
+2) Use 'search_project' to find unknown components.
+3) CRITICAL: Before calling a tool, you MUST write a brief 1-2 sentence explanation of your thought process in the message content (e.g., "I need to find the notification component, I will search for it first.").
+
+FINAL OUTPUT CONTRACT (STRICT)
+- Return exactly ONE valid JSON object.
+- JSON shape:
+{
+  "targetRoute": "/path",
+  "commitMessage": "feat: summary",
+  "edits": [
+    { 
+      "filepath": "relative/path.ts", 
+      "search": "exact code to replace", 
+      "replace": "new code" 
+    }
+  ]
+}
+- If creating a NEW file, leave "search" empty.
+`;
+}
+
+function extractJsonObject(raw: string): string {
+  let text = (raw || '').trim().replace(/```json/gi, '').replace(/```/g, '').trim();
+  text = text.replace(/[\u00A0\u2028\u2029\u200B]/g, ' ');
+
+  const firstBrace = text.indexOf('{');
+  const lastBrace = text.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace >= firstBrace) {
+    return text.slice(firstBrace, lastBrace + 1);
+  }
+  throw new Error('No JSON object found.');
+}
+
+function resolveSafeFilePath(relativeFilePath: string): string {
+  const repoRoot = path.resolve(TARGET_REPO_PATH);
+  const fullPath = path.resolve(repoRoot, relativeFilePath);
+  if (fullPath !== repoRoot && !fullPath.startsWith(`${repoRoot}${path.sep}`)) {
+    throw new Error(`Blocked unsafe path: ${relativeFilePath}`);
+  }
+  return fullPath;
+}
 
 export async function generateAndWriteCode(
-    userPrompt: string, 
-    figmaData: string | null, 
-    projectTree: string 
-): Promise<{ targetRoute: string, commitMessage: string }> {
-    
-    console.log(`🧠 AI Agent Initialized: DEEPSEEK (Agentic Mode)`);
+  userPrompt: string,
+  figmaData: string | null,
+  projectTree: string,
+  onStatusUpdate?: (status: string, thought?: string) => void // 👈 Añadimos el thought al callback
+): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number }> {
+  
+  const openai = new OpenAI({ baseURL: 'https://api.deepseek.com', apiKey: process.env.DEEPSEEK_API_KEY as string });
 
-    const figmaInstructions = figmaData ? `JSON FIGMA: ${figmaData}` : "";
+  const messages: any[] = [
+    { role: 'system', content: buildSystemPrompt(userPrompt, figmaData, projectTree) },
+    { role: 'user', content: userPrompt },
+  ];
 
-    const systemPrompt = `
-    You are Jarvis, an Expert Autonomous AI Software Architect for React Native (Expo).
-    
-    PROJECT MAP (Directory Tree):
-    ${projectTree ? projectTree : "(Empty)"}
-    
-    ${figmaInstructions}
+  let finalResult: AIResponse | null = null;
+  const MAX_LOOPS = 100;
+  let totalTokens = 0; 
 
-    YOUR OBJECTIVE:
-    "${userPrompt}"
-    
-    AGENT RULES:
-    1. You DO NOT know the contents of the files yet. You ONLY see the map above.
-    2. You MUST use the 'read_file' tool to inspect a file's code before you try to edit it.
-    3. If you don't know where a component is located, use the 'search_project' tool.
-    4. Once you have all the context you need, you MUST output a FINAL JSON response.
-    
-    FINAL OUTPUT RULES (ABSOLUTE):
-    When you are ready to deliver the final code, your message MUST be ONLY a valid JSON object.
-    {
-      "targetRoute": "/path-to-test",
-      "commitMessage": "feat(profile): added delete account button",
-      "files": [
-        { "filepath": "app/(tabs)/index.tsx", "code": "full new code..." }
-      ]
-    }
-    `;
+  for (let loop = 1; loop <= MAX_LOOPS; loop++) {
+    const statusMsg = `🔄 Iteration ${loop}... Thinking...`;
+    console.log(statusMsg);
+    if (onStatusUpdate) onStatusUpdate(statusMsg);
 
-    const openai = new OpenAI({ 
-        baseURL: 'https://api.deepseek.com', 
-        apiKey: process.env.DEEPSEEK_API_KEY as string 
+    const response = await openai.chat.completions.create({
+      model: 'deepseek-chat',
+      messages,
+      tools: agentTools,
+      temperature: 0.1,
+      max_tokens: 8192,
     });
 
-    const messages: any[] = [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: userPrompt }
-    ];
+    if (response.usage) {
+      totalTokens += response.usage.total_tokens;
+    }
 
-    let finalRawText = '';
-    let loopCount = 0;
-    const MAX_LOOPS = 100; 
+    const message = response.choices?.[0]?.message;
+    if (!message) throw new Error('Model returned an empty response.');
 
-    while (loopCount < MAX_LOOPS) {
-        loopCount++;
-        console.log(`⏳ Agent thinking... (Iteration ${loopCount})`);
+    messages.push(message);
 
-        const response = await openai.chat.completions.create({
-            model: 'deepseek-chat',
-            messages: messages,
-            tools: agentTools,
-            temperature: 0.1,
-            max_tokens: 8192
-        });
+    // 🧠 EXTRAEMOS EL PENSAMIENTO DE LA IA
+    const agentThought = message.content ? message.content.trim() : "";
 
-        const msg = response.choices[0].message;
-        messages.push(msg);
+    if (message.tool_calls?.length) {
+      for (const toolCall of message.tool_calls) {
+        const functionName = toolCall.function.name;
+        let toolResult = '';
 
-        if (msg.tool_calls && msg.tool_calls.length > 0) {
-            for (const toolCall of msg.tool_calls) {
-                const funcName = toolCall.function.name;
-                const args = JSON.parse(toolCall.function.arguments);
-                let toolResult = "";
+        try {
+          const args = JSON.parse(toolCall.function.arguments || '{}');
+          const toolMsg = `🛠️ Executing: ${functionName} -> ${args.filepath || args.keyword}`;
+          console.log(toolMsg);
+          
+          // 👈 Pasamos el estado Y el pensamiento al callback
+          if (onStatusUpdate) onStatusUpdate(toolMsg, agentThought);
 
-                if (funcName === "read_file") {
-                    toolResult = readFile(args.filepath);
-                } else if (funcName === "search_project") {
-                    toolResult = searchProject(args.keyword);
-                }
-
-                messages.push({
-                    role: "tool",
-                    tool_call_id: toolCall.id,
-                    name: funcName,
-                    content: toolResult
-                });
-            }
-        } else {
-            console.log(`✅ Agent finished thinking! Delivering code...`);
-            finalRawText = msg.content || '{}';
-            break;
+          if (functionName === 'read_file') {
+            toolResult = readFile(args.filepath, args.startLine, args.endLine);
+          } else if (functionName === 'search_project') {
+            toolResult = searchProject(args.keyword, args.maxResults);
+          }
+        } catch (error: any) {
+          toolResult = `Tool error: ${error.message}`;
         }
+
+        messages.push({ role: 'tool', tool_call_id: toolCall.id, name: functionName, content: toolResult });
+      }
+      continue;
     }
 
-    if (loopCount >= MAX_LOOPS) {
-        throw new Error("Agent reached maximum loop limit without returning the final JSON.");
-    }
-
-    // Extractor agresivo de JSON y limpieza
-    finalRawText = finalRawText.replace(/```json/gi, '').replace(/```/g, '').trim();
-    const firstBrace = finalRawText.indexOf('{');
-    const lastBrace = finalRawText.lastIndexOf('}');
-    if (firstBrace !== -1 && lastBrace !== -1 && lastBrace >= firstBrace) {
-        finalRawText = finalRawText.substring(firstBrace, lastBrace + 1);
-    }
-    finalRawText = finalRawText.replace(/[\u00A0\u2028\u2029\u200B]/g, ' ');
-
+    const modelText = message.content || '';
     try {
-        const parsedData: AIResponse = JSON.parse(finalRawText);
-        const filesToCreate = parsedData.files || [];
-        const targetRoute = parsedData.targetRoute || '/';
-        const commitMessage = parsedData.commitMessage || 'feat: update via Jarvis Agent';
-
-        for (const file of filesToCreate) {
-            const fullPath = path.join(TARGET_REPO_PATH, file.filepath);
-            const dir = path.dirname(fullPath);
-            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-            fs.writeFileSync(fullPath, file.code);
-        }
-        
-        console.log(`📍 Route: ${targetRoute} | 📝 Commit: ${commitMessage}`);
-        return { targetRoute, commitMessage };
-
-    } catch (error) {
-        console.error("❌ RAW AI RESPONSE QUE ROMPIÓ EL JSON:\n", finalRawText);
-        throw new Error("The AI failed to format the response as JSON. Please try again.");
+      const candidate = extractJsonObject(modelText);
+      finalResult = JSON.parse(candidate) as AIResponse;
+      
+      // Si antes de darnos el JSON tuvo un pensamiento final, lo mostramos
+      if (agentThought && onStatusUpdate) {
+          onStatusUpdate(`✅ Preparing final code delivery...`, agentThought);
+      }
+      break;
+    } catch {
+      messages.push({ role: 'user', content: 'Response was not valid JSON or failed to parse. Return exactly one JSON object.' });
     }
+  }
+
+  if (!finalResult) throw new Error('Agent reached loop limit without valid JSON.');
+
+  if (onStatusUpdate) onStatusUpdate(`✅ Code ready! Applying surgical edits...`);
+
+  // ✂️ APLICANDO EDICIÓN QUIRÚRGICA
+  for (const edit of finalResult.edits || []) {
+    if (!edit.filepath) continue;
+    const fullPath = resolveSafeFilePath(edit.filepath);
+    const dir = path.dirname(fullPath);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+
+    if (!fs.existsSync(fullPath) || edit.search.trim() === "") {
+        fs.writeFileSync(fullPath, edit.replace, 'utf8'); // Archivo nuevo
+        continue;
+    }
+
+    let content = fs.readFileSync(fullPath, 'utf8');
+    if (content.includes(edit.search)) {
+        content = content.replace(edit.search, edit.replace);
+        fs.writeFileSync(fullPath, content, 'utf8');
+    } else {
+        console.warn(`⚠️ Warning: Exact search block not found in ${edit.filepath}.`);
+    }
+  }
+
+  return { targetRoute: finalResult.targetRoute || '/', commitMessage: finalResult.commitMessage || 'feat: auto-update', tokenUsage: totalTokens };
 }

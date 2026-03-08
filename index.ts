@@ -3,7 +3,7 @@ import 'dotenv/config';
 
 import { TARGET_REPO_PATH } from './src/config.js';
 import { prepareWorkspace, createPullRequest } from './src/git.js';
-import { getProjectTree } from './src/scanner.js'; // 🗺️ Ahora importamos el árbol
+import { getProjectTree } from './src/scanner.js';
 import { getFigmaContext } from './src/figma.js';
 import { takeSnapshot } from './src/snapshot.js';
 import { generateAndWriteCode } from './src/ai.js';
@@ -19,9 +19,19 @@ client.on('messageCreate', async (message: Message) => {
 
     const replyMessage = await message.reply(
         isIteration 
-        ? '🤖 Acknowledged. Agent iterating over current modifications...' 
+        ? '🤖 Acknowledged. Agent waking up for iteration...' 
         : '🤖 Acknowledged. Preparing a fresh workspace...'
     );
+
+    // 🧵 CREAMOS EL HILO EN EL MENSAJE DEL USUARIO
+    const threadName = message.content.length > 20 
+        ? `🧠 Jarvis Logs - ${message.content.substring(0, 20)}...` 
+        : `🧠 Jarvis Logs - ${message.content}`;
+        
+    const thread = await message.startThread({
+        name: threadName,
+        autoArchiveDuration: 60,
+    });
 
     try {
         if (!isIteration) {
@@ -29,39 +39,58 @@ client.on('messageCreate', async (message: Message) => {
         }
         
         const figmaData = await getFigmaContext(message.content);
-        if (figmaData) await replyMessage.edit('🎨 Figma link detected. Analyzing design...');
+        if (figmaData) await thread.send('🎨 Figma link detected. Analyzing design...');
         
-        // 🗺️ Generamos el mapa ligero del proyecto
         const projectTree = getProjectTree(TARGET_REPO_PATH);
         
         const finalPrompt = isIteration 
             ? `We are iterating on the current code. Keep the recent changes but apply this correction: "${message.content}"` 
             : message.content;
 
-        // Pasamos el árbol al Agente
-        const { targetRoute, commitMessage } = await generateAndWriteCode(finalPrompt, figmaData, projectTree);
+        // 👁️ Live Feed Callback al Hilo
+        const { targetRoute, commitMessage, tokenUsage } = await generateAndWriteCode(
+            finalPrompt, figmaData, projectTree,
+            async (statusMsg, thought) => {
+                let logMessage = `**${statusMsg}**`;
+                if (thought && thought !== "") {
+                    // Formateamos el pensamiento de la IA como un bloque de cita para que se vea limpio
+                    logMessage += `\n> 💭 *${thought.replace(/\n/g, '\n> ')}*`;
+                }
+                // Lo mandamos al hilo en vez de editar el mensaje principal
+                await thread.send(logMessage).catch(() => {});
+            }
+        );
         
         const sessionId = Date.now().toString().slice(-6);
         sessionStore.set(sessionId, commitMessage);
         
-        await replyMessage.edit(`📸 Code generated. Navigating to \`${targetRoute}\`...`);
-        const actualSnapshotPath = await takeSnapshot(targetRoute);
+        await thread.send(`📸 Code generated. Navigating to \`${targetRoute}\` to take snapshot...`);
+        const { snapshotPath, liveUrl, warning } = await takeSnapshot(targetRoute);
 
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
-            new ButtonBuilder().setCustomId(`approve_${sessionId}`).setLabel('✅ Approve & Create PR').setStyle(ButtonStyle.Success),
-            new ButtonBuilder().setCustomId(`reject_${sessionId}`).setLabel('🔄 Reject / Iterate').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId(`approve_${sessionId}`).setLabel('✅ Approve & PR').setStyle(ButtonStyle.Success),
+            new ButtonBuilder().setCustomId(`reject_${sessionId}`).setLabel('🔄 Reject').setStyle(ButtonStyle.Danger),
         );
 
-        await replyMessage.edit({ 
-            content: `✨ Ready! (Agent: DEEPSEEK)\n📝 **Commit:** \`${commitMessage}\``,
-            files: [new AttachmentBuilder(actualSnapshotPath)],
-            components: [row]
-        });
+        const finalContent = `✨ **Ready!**\n📝 **Commit:** \`${commitMessage}\`\n💰 **Tokens Used:** \`${tokenUsage.toLocaleString()}\`\n🌐 **Live URL:** ${liveUrl}\n${warning ? `⚠️ *${warning}*` : ''}`;
+
+        // El mensaje principal recibe el resultado final
+        if (snapshotPath) {
+            await replyMessage.edit({ content: finalContent, files: [new AttachmentBuilder(snapshotPath)], components: [row] });
+        } else {
+            await replyMessage.edit({ content: finalContent, components: [row] });
+        }
+
+        // Cerramos el hilo suavemente
+        await thread.send("✅ Task completed. Archiving thread.");
+        await thread.setArchived(true);
 
     } catch (error: any) {
         console.error(error);
         const safeError = error.message.length > 1500 ? error.message.substring(0, 1500) + '...' : error.message;
-        await replyMessage.edit(`❌ Error:\n\`\`\`bash\n${safeError}\n\`\`\``);
+        
+        await thread.send(`❌ **CRITICAL ERROR:**\n\`\`\`bash\n${safeError}\n\`\`\``);
+        await replyMessage.edit(`❌ Error encountered. Please check the thread logs for details.`);
     }
 });
 
@@ -75,11 +104,8 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         
         try {
             const exactCommitMessage = sessionStore.get(sessionId) || 'feat: update from Jarvis';
-            const featureName = `req-${sessionId}`; 
-            
-            const prUrl = await createPullRequest(featureName, exactCommitMessage);
+            const prUrl = await createPullRequest(`req-${sessionId}`, exactCommitMessage);
             await interaction.followUp(`✅ **Pull Request successfully created!**\n🔗 Review here: ${prUrl}`);
-            
             sessionStore.delete(sessionId);
         } catch (error) {
             console.error(error);
@@ -96,4 +122,4 @@ client.on('interactionCreate', async (interaction: Interaction) => {
 });
 
 client.login(process.env.DISCORD_TOKEN as string);
-console.log('🤖 Jarvis Git Flow Agent listening on Discord...');
+console.log('🤖 Jarvis Architect listening on Discord...');
