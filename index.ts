@@ -7,7 +7,7 @@ import path from 'path';
 
 import { TARGET_REPO_PATH, setActiveProject, WORKSPACE_DIR } from './src/config.js';
 import { prepareWorkspace, createPullRequest } from './src/git.js';
-import { getProjectTree } from './src/scanner.js';
+import { getProjectTree, getProjectMemory } from './src/scanner.js';
 import { getFigmaContext } from './src/figma.js';
 import { takeSnapshot } from './src/snapshot.js';
 import { generateAndWriteCode } from './src/ai.js';
@@ -48,13 +48,19 @@ client.on('messageCreate', async (message: Message) => {
         if (figmaData) await thread.send('🎨 Figma link detected. Analyzing design...');
         
         const projectTree = getProjectTree(TARGET_REPO_PATH);
+        const projectMemory = getProjectMemory(TARGET_REPO_PATH);
+        
+        // 👇 NUEVO: Notificación en Discord de que la memoria fue cargada
+        if (projectMemory) {
+            await thread.send('🧠 UnityRC memory loaded. Applying architectural rules...');
+        }
         
         const finalPrompt = isIteration 
             ? `We are iterating on the current code. Keep the recent changes but apply this correction: "${message.content}"` 
             : message.content;
 
         const { targetRoute, commitMessage, tokenUsage } = await generateAndWriteCode(
-            finalPrompt, figmaData, projectTree,
+            finalPrompt, figmaData, projectTree, projectMemory,
             async (statusMsg, thought) => {
                 let logMessage = `**${statusMsg}**`;
                 if (thought && thought !== "") {
@@ -71,7 +77,7 @@ client.on('messageCreate', async (message: Message) => {
         
         const { snapshotPath, publicUrl, localUrl, warning } = await takeSnapshot(targetRoute);
 
-        // 📝 NUEVO: Capturar el diff de Git antes de enviar el mensaje
+        // Capturar el diff de Git antes de enviar el mensaje
         const { stdout: diffOutput } = await execPromise(`git diff`, { cwd: TARGET_REPO_PATH }).catch(() => ({ stdout: '' }));
         let diffPath = null;
         if (diffOutput && diffOutput.trim() !== '') {
@@ -81,14 +87,14 @@ client.on('messageCreate', async (message: Message) => {
 
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
             new ButtonBuilder().setCustomId(`approve_${sessionId}`).setLabel('✅ Approve & PR').setStyle(ButtonStyle.Success),
-            // 🛑 Botón rojo destructivo explícito
+            // Botón rojo destructivo explícito
             new ButtonBuilder().setCustomId(`reject_${sessionId}`).setLabel('🗑️ Revert (Start Over)').setStyle(ButtonStyle.Danger),
         );
 
-        // 💡 Instrucciones claras para iterar
+        // Instrucciones claras para iterar
         const finalContent = `✨ **Ready!**\n📝 **Commit:** \`${commitMessage}\`\n💰 **Tokens Used:** \`${tokenUsage.toLocaleString()}\`\n🏠 **Local:** ${localUrl}\n📱 **Mobile (Wi-Fi):** ${publicUrl ? publicUrl : 'Unavailable'}\n\n👉 **¿Quieres iterar?** Simplemente RESPONDE a este mensaje con tus correcciones.\n${warning ? `\n⚠️ *${warning}*` : ''}`;
 
-        // 📎 Adjuntar la foto y el archivo de código (.diff)
+        // Adjuntar la foto y el archivo de código (.diff)
         const filesToAttach = [];
         if (snapshotPath) filesToAttach.push(new AttachmentBuilder(snapshotPath));
         if (diffPath) filesToAttach.push(new AttachmentBuilder(diffPath));
@@ -113,7 +119,7 @@ client.on('messageCreate', async (message: Message) => {
 
 client.on('interactionCreate', async (interaction: Interaction) => {
     
-    // 🔘 1. MANEJO DE BOTONES
+    // 1. MANEJO DE BOTONES
     if (interaction.isButton()) {
         const [action, sessionId] = interaction.customId.split('_');
 
@@ -129,7 +135,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
                 await interaction.followUp(`❌ Failed to create PR.`);
             }
         } else if (action === 'reject') {
-            // 🧹 Abortar misión: Limpiamos los archivos modificados localmente
+            // Abortar misión: Limpiamos los archivos modificados localmente
             await execPromise(`git reset --hard HEAD`, { cwd: TARGET_REPO_PATH }).catch(() => {});
             await execPromise(`git clean -fd`, { cwd: TARGET_REPO_PATH }).catch(() => {});
             
@@ -143,7 +149,7 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         return;
     }
 
-    // ⌨️ 2. MANEJO DE SLASH COMMANDS
+    // 2. MANEJO DE SLASH COMMANDS
     if (interaction.isChatInputCommand()) {
         const { commandName } = interaction;
 

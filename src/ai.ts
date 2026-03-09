@@ -25,8 +25,14 @@ DELIVERY RULES
 - Use "search" and "replace" blocks to patch files. The "search" string MUST perfectly match existing code.
 `;
 
-function buildSystemPrompt(userPrompt: string, figmaData: string | null, projectTree: string): string {
+// Actualizamos la firma para recibir la memoria
+function buildSystemPrompt(userPrompt: string, figmaData: string | null, projectTree: string, projectMemory: string | null): string {
   const figmaInstructions = figmaData ? `FIGMA JSON CONTEXT:\n${figmaData}` : 'FIGMA JSON CONTEXT: (none)';
+  
+  //Inyectamos la memoria en el System Prompt
+  const memoryInstructions = projectMemory 
+    ? `\n\n### 🧠 REGLAS ESTRICTAS DEL PROYECTO (.unityrc.md) 🧠\nYou MUST strictly follow these architectural rules for this project:\n${projectMemory}\n` 
+    : '';
 
   return `
 You are Jarvis, a senior autonomous software architect.
@@ -35,7 +41,7 @@ PROJECT TREE
 ${projectTree || '(empty)'}
 
 ${REPO_PATTERNS}
-${figmaInstructions}
+${figmaInstructions}${memoryInstructions}
 
 USER OBJECTIVE
 "${userPrompt}"
@@ -86,17 +92,20 @@ function resolveSafeFilePath(relativeFilePath: string): string {
   return fullPath;
 }
 
+// 👇 CAMBIO 6: Actualizamos la firma para recibir la memoria
 export async function generateAndWriteCode(
   userPrompt: string,
   figmaData: string | null,
   projectTree: string,
+  projectMemory: string | null,
   onStatusUpdate?: (status: string, thought?: string) => void
 ): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number }> {
   
   const openai = new OpenAI({ baseURL: 'https://api.deepseek.com', apiKey: process.env.DEEPSEEK_API_KEY as string });
 
   const messages: any[] = [
-    { role: 'system', content: buildSystemPrompt(userPrompt, figmaData, projectTree) },
+    //Pasamos la memoria a la función que construye el prompt
+    { role: 'system', content: buildSystemPrompt(userPrompt, figmaData, projectTree, projectMemory) },
     { role: 'user', content: userPrompt },
   ];
 

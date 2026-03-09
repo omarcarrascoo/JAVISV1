@@ -37,3 +37,17 @@ export function getProjectTree(dirPath: string, prefix: string = ''): string {
     }
     return tree;
 }
+
+export function getProjectMemory(repoPath: string): string | null {
+    const memoryPath = path.join(repoPath, 'unityrc.md');
+    
+    if (fs.existsSync(memoryPath)) {
+        console.log(`🧠 Memoria de proyecto detectada en: ${memoryPath}`);
+        return fs.readFileSync(memoryPath, 'utf8');
+    }
+    else {
+        console.log(`⚠️ No se encontró memoria de proyecto en: ${memoryPath}`);
+    }
+    
+    return null;
+}
