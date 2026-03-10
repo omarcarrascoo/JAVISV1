@@ -198,10 +198,21 @@ These control the active workspace.
 
 ```mermaid
 flowchart TD
-    P[User Prompt] --> R[Figma MCP nodes] --> R[Agent Reasoning]
+    P[User Prompt]
+
+    P --> D{Detect Figma Link?}
+
+    D -->|Yes| F[Figma MCP Fetch Nodes]
+    F --> CL[Filter / Clean Figma Nodes]
+
+    D -->|No| R
+
+    CL --> R[Agent Reasoning]
+
     R --> T[Tool Call]
     T --> C[Tool Result]
     C --> R
+
     R --> E[Code Edits]
     E --> V[TypeScript Validation]
     V --> S[Snapshot]
