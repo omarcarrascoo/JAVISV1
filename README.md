@@ -44,21 +44,6 @@ Capabilities:
 # 🏗 System Architecture
 
 ```mermaid
-flowchart LR
-    U[Discord user in jarvis-dev] --> D[index.ts]
-    D --> W[prepareWorkspace - src/git.ts]
-    D --> S[getProjectTree + getProjectMemory - src/scanner.ts]
-    D --> F[getFigmaContext - src/figma.ts]
-    D --> A[generateAndWriteCode - src/ai.ts]
-    A --> T[Tool layer - src/tools.ts]
-    T --> R[(Target repo in workspaces)]
-    A --> C[TypeScript validation loop - npx tsc --noEmit]
-    D --> P[takeSnapshot - src/snapshot.ts]
-    P --> X[Expo + Puppeteer screenshot]
-    D --> PR[Approve button to createPullRequest]
-```
-
-```mermaid
 flowchart TD
     %% Entradas de Usuario
     U[Discord User in #jarvis-dev] --> D[index.ts Orchestrator]
