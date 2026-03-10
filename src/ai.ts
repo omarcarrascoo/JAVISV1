@@ -29,11 +29,16 @@ DELIVERY RULES
 - Use "search" and "replace" blocks to patch files. The "search" string MUST perfectly match existing code.
 `;
 
-function buildSystemPrompt(userPrompt: string, figmaData: string | null, projectTree: string, projectMemory: string | null): string {
+function buildSystemPrompt(userPrompt: string, figmaData: string | null, projectTree: string, projectMemory: string | null, currentDiff: string | null): string {
   const figmaInstructions = figmaData ? `FIGMA JSON CONTEXT:\n${figmaData}` : 'FIGMA JSON CONTEXT: (none)';
   
   const memoryInstructions = projectMemory 
     ? `\n\n### 🧠 STRICT PROJECT RULES (.unityrc.md) 🧠\nYou MUST strictly follow these architectural rules for this project:\n${projectMemory}\n` 
+    : '';
+
+  // 🧠 DE VUELTA: Inyectamos el diff actual si estamos en una iteración
+  const diffInstructions = currentDiff 
+    ? `\n\n### 📝 UNCOMMITTED CHANGES (SHORT-TERM MEMORY) 📝\nYou are in an iteration. You have ALREADY made the following changes in this session. DO NOT undo them unless explicitly asked. Use this as context for what you just built:\n\`\`\`diff\n${currentDiff.substring(0, 4000)}\n\`\`\`\n` 
     : '';
 
   return `
@@ -43,7 +48,7 @@ PROJECT TREE
 ${projectTree || '(empty)'}
 
 ${REPO_PATTERNS}
-${figmaInstructions}${memoryInstructions}
+${figmaInstructions}${memoryInstructions}${diffInstructions}
 
 USER OBJECTIVE
 "${userPrompt}"
@@ -95,7 +100,6 @@ function resolveSafeFilePath(relativeFilePath: string): string {
   return fullPath;
 }
 
-// Función para inyectar código y detectar errores de parcheo
 function applyEditsToFiles(edits: FileEdit[]): string[] {
     const patchErrors: string[] = [];
     
@@ -126,13 +130,14 @@ export async function generateAndWriteCode(
   figmaData: string | null,
   projectTree: string,
   projectMemory: string | null,
+  currentDiff: string | null, // 👈 Lo volvemos a recibir
   onStatusUpdate?: (status: string, thought?: string) => void
 ): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number }> {
   
   const openai = new OpenAI({ baseURL: 'https://api.deepseek.com', apiKey: process.env.DEEPSEEK_API_KEY as string });
 
   const messages: any[] = [
-    { role: 'system', content: buildSystemPrompt(userPrompt, figmaData, projectTree, projectMemory) },
+    { role: 'system', content: buildSystemPrompt(userPrompt, figmaData, projectTree, projectMemory, currentDiff) },
     { role: 'user', content: userPrompt },
   ];
 
@@ -164,7 +169,6 @@ export async function generateAndWriteCode(
 
     const agentThought = message.content ? message.content.trim() : "";
 
-    // Manejo de herramientas (read_file, etc.)
     if (message.tool_calls?.length) {
       for (const toolCall of message.tool_calls) {
         const functionName = toolCall.function.name;
@@ -193,7 +197,6 @@ export async function generateAndWriteCode(
       continue;
     }
 
-    // Análisis de salida JSON
     const modelText = message.content || '';
     try {
       const candidate = extractJsonObject(modelText);
@@ -201,7 +204,6 @@ export async function generateAndWriteCode(
       
       if (agentThought && onStatusUpdate) onStatusUpdate(`🧪 Validating syntax and compilation...`, agentThought);
 
-      // BUCLE DE AUTO-SANACIÓN PASO 1: Inyectar y verificar Patch
       const patchErrors = applyEditsToFiles(finalResult.edits || []);
       if (patchErrors.length > 0) {
           messages.push({ 
@@ -213,9 +215,7 @@ export async function generateAndWriteCode(
           continue; 
       }
 
-      // BUCLE DE AUTO-SANACIÓN PASO 2: Verificar TypeScript (Nest/Expo)
       let compilationErrors = '';
-      
       const dirsToCheck = new Set((finalResult.edits || []).map(e => {
           const parts = e.filepath.split('/');
           return parts.length > 1 ? parts[0] : '.'; 
@@ -223,7 +223,6 @@ export async function generateAndWriteCode(
 
       for (const dir of dirsToCheck) {
           const checkPath = dir === '.' ? TARGET_REPO_PATH : path.join(TARGET_REPO_PATH, dir);
-          
           if (fs.existsSync(path.join(checkPath, 'tsconfig.json'))) {
               try {
                   await execPromise(`npx tsc --noEmit`, { cwd: checkPath });
@@ -233,7 +232,6 @@ export async function generateAndWriteCode(
           }
       }
 
-      // 📉 Truncamos el error a 800 caracteres máximo para ahorrar tokens
       if (compilationErrors.trim() !== '') {
           messages.push({ 
               role: 'user', 
@@ -255,4 +253,29 @@ export async function generateAndWriteCode(
   if (!finalResult) throw new Error('Agent reached loop limit without passing compilation checks.');
 
   return { targetRoute: finalResult.targetRoute || '/', commitMessage: finalResult.commitMessage || 'feat: auto-update', tokenUsage: totalTokens };
+}
+
+// Generador de PRs Inteligentes
+export async function generatePRMetadata(diff: string): Promise<string> {
+  const openai = new OpenAI({ baseURL: 'https://api.deepseek.com', apiKey: process.env.DEEPSEEK_API_KEY as string });
+  
+  const prompt = `You are an expert developer. I will provide you with a git diff of the work done in this session.
+  Please generate a conventional commit message that summarizes ALL the changes comprehensively. 
+  Format it as a single string where the first line is the conventional commit title (e.g., feat: added login screen), followed by a blank line, and then a brief bulleted list of the key changes.
+  
+  GIT DIFF:
+  ${diff.substring(0, 6000)}`;
+
+  try {
+      const response = await openai.chat.completions.create({
+          model: 'deepseek-chat',
+          messages: [{ role: 'user', content: prompt }],
+          temperature: 0.3,
+          max_tokens: 500,
+      });
+      return response.choices[0]?.message?.content?.trim() || 'feat: accumulated session updates';
+  } catch (error) {
+      console.error("Error generating Smart PR:", error);
+      return 'feat: accumulated session updates';
+  }
 }

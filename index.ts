@@ -10,12 +10,10 @@ import { prepareWorkspace, createPullRequest } from './src/git.js';
 import { getProjectTree, getProjectMemory } from './src/scanner.js';
 import { getFigmaContext } from './src/figma.js';
 import { takeSnapshot } from './src/snapshot.js';
-import { generateAndWriteCode } from './src/ai.js';
+import { generateAndWriteCode, generatePRMetadata } from './src/ai.js';
 
 const execPromise = util.promisify(exec);
-
 const client = new Client({ intents: [ GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent ]});
-
 const sessionStore = new Map<string, string>();
 
 client.on('messageCreate', async (message: Message) => {
@@ -39,7 +37,6 @@ client.on('messageCreate', async (message: Message) => {
     });
 
     try {
-        // Solo limpiamos y preparamos el workspace si es un requerimiento nuevo
         if (!isIteration) {
             await prepareWorkspace();
         }
@@ -50,9 +47,18 @@ client.on('messageCreate', async (message: Message) => {
         const projectTree = getProjectTree(TARGET_REPO_PATH);
         const projectMemory = getProjectMemory(TARGET_REPO_PATH);
         
-        // 👇 NUEVO: Notificación en Discord de que la memoria fue cargada
         if (projectMemory) {
             await thread.send('🧠 UnityRC memory loaded. Applying architectural rules...');
+        }
+
+        // 🧠 DE VUELTA: Capturar el diff actual si es iteración
+        let currentDiff = null;
+        if (isIteration) {
+            const { stdout } = await execPromise(`git diff`, { cwd: TARGET_REPO_PATH }).catch(() => ({ stdout: '' }));
+            if (stdout.trim()) {
+                currentDiff = stdout;
+                await thread.send('🔄 Short-Term Memory loaded. Analyzing uncommitted changes...');
+            }
         }
         
         const finalPrompt = isIteration 
@@ -60,7 +66,7 @@ client.on('messageCreate', async (message: Message) => {
             : message.content;
 
         const { targetRoute, commitMessage, tokenUsage } = await generateAndWriteCode(
-            finalPrompt, figmaData, projectTree, projectMemory,
+            finalPrompt, figmaData, projectTree, projectMemory, currentDiff, // 👈 Pasamos el currentDiff
             async (statusMsg, thought) => {
                 let logMessage = `**${statusMsg}**`;
                 if (thought && thought !== "") {
@@ -77,7 +83,6 @@ client.on('messageCreate', async (message: Message) => {
         
         const { snapshotPath, publicUrl, localUrl, warning } = await takeSnapshot(targetRoute);
 
-        // Capturar el diff de Git antes de enviar el mensaje
         const { stdout: diffOutput } = await execPromise(`git diff`, { cwd: TARGET_REPO_PATH }).catch(() => ({ stdout: '' }));
         let diffPath = null;
         if (diffOutput && diffOutput.trim() !== '') {
@@ -87,14 +92,11 @@ client.on('messageCreate', async (message: Message) => {
 
         const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
             new ButtonBuilder().setCustomId(`approve_${sessionId}`).setLabel('✅ Approve & PR').setStyle(ButtonStyle.Success),
-            // Botón rojo destructivo explícito
             new ButtonBuilder().setCustomId(`reject_${sessionId}`).setLabel('🗑️ Revert (Start Over)').setStyle(ButtonStyle.Danger),
         );
 
-        // Instrucciones claras para iterar
         const finalContent = `✨ **Ready!**\n📝 **Commit:** \`${commitMessage}\`\n💰 **Tokens Used:** \`${tokenUsage.toLocaleString()}\`\n🏠 **Local:** ${localUrl}\n📱 **Mobile (Wi-Fi):** ${publicUrl ? publicUrl : 'Unavailable'}\n\n👉 **¿Quieres iterar?** Simplemente RESPONDE a este mensaje con tus correcciones.\n${warning ? `\n⚠️ *${warning}*` : ''}`;
 
-        // Adjuntar la foto y el archivo de código (.diff)
         const filesToAttach = [];
         if (snapshotPath) filesToAttach.push(new AttachmentBuilder(snapshotPath));
         if (diffPath) filesToAttach.push(new AttachmentBuilder(diffPath));
@@ -119,28 +121,31 @@ client.on('messageCreate', async (message: Message) => {
 
 client.on('interactionCreate', async (interaction: Interaction) => {
     
-    // 1. MANEJO DE BOTONES
     if (interaction.isButton()) {
         const [action, sessionId] = interaction.customId.split('_');
 
         if (action === 'approve') {
-            await interaction.update({ content: '🚀 Creating PR with exact commit message...', components: [], files: [] });
+            await interaction.update({ content: '🚀 Analyzing all session changes to generate a Smart PR...', components: [], files: [] });
             try {
-                const exactCommitMessage = sessionStore.get(sessionId) || 'feat: update from Jarvis';
-                const prUrl = await createPullRequest(`req-${sessionId}`, exactCommitMessage);
-                await interaction.followUp(`✅ **Pull Request successfully created!**\n🔗 Review here: ${prUrl}`);
+                const { stdout: finalDiff } = await execPromise(`git diff`, { cwd: TARGET_REPO_PATH }).catch(() => ({ stdout: '' }));
+                
+                const smartCommitMsg = finalDiff.trim() 
+                    ? await generatePRMetadata(finalDiff) 
+                    : sessionStore.get(sessionId) || 'feat: update from Jarvis';
+
+                const prUrl = await createPullRequest(`req-${sessionId}`, smartCommitMsg);
+                await interaction.followUp(`✅ **Smart Pull Request successfully created!**\n🔗 Review here: ${prUrl}`);
                 sessionStore.delete(sessionId);
             } catch (error) {
                 console.error(error);
                 await interaction.followUp(`❌ Failed to create PR.`);
             }
         } else if (action === 'reject') {
-            // Abortar misión: Limpiamos los archivos modificados localmente
             await execPromise(`git reset --hard HEAD`, { cwd: TARGET_REPO_PATH }).catch(() => {});
             await execPromise(`git clean -fd`, { cwd: TARGET_REPO_PATH }).catch(() => {});
             
             await interaction.update({ 
-                content: '🗑️ **Cambios revertidos.** El repositorio ha vuelto a su estado original limpio.\nPuedes enviar un nuevo mensaje para intentar otra aproximación.', 
+                content: '🗑️ **Cambios revertidos.** El repositorio ha vuelto a su estado original limpio.', 
                 components: [], 
                 files: [] 
             });
@@ -149,7 +154,6 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         return;
     }
 
-    // 2. MANEJO DE SLASH COMMANDS
     if (interaction.isChatInputCommand()) {
         const { commandName } = interaction;
 
