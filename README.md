@@ -58,6 +58,63 @@ flowchart LR
     D --> PR[Approve button to createPullRequest]
 ```
 
+```mermaid
+flowchart TD
+    %% Entradas de Usuario
+    U[Discord User in #jarvis-dev] --> D[index.ts Orchestrator]
+    
+    %% Cadenero y Seguros
+    D --> Locks{Locks: isProcessing? Unsaved work?}
+    Locks -->|Locked| Reject[Send Warning Message]
+    Locks -->|Clear| Type{Is Iteration?}
+
+    %% Preparación del Contexto
+    Type -->|No| W[prepareWorkspace: clean environment]
+    Type -->|Yes| Diff[Get git diff: Short-Term Memory]
+
+    W --> F[getFigmaContext]
+    Diff --> F
+
+    F --> S[Scanner: getProjectTree & getProjectMemory]
+
+    %% Bucle Principal de la IA
+    S --> AI[generateAndWriteCode - src/ai.ts]
+    
+    subgraph Self_Healing_Loop [The Arena: Self-Healing Agent Loop]
+        AI --> LLM[DeepSeek LLM]
+        
+        %% Herramientas
+        LLM -->|Tool Calls| T[Tool Layer: read_file, search, run_command]
+        T --> Repo[(Target Repo in Workspaces)]
+        T --> LLM
+        
+        %% Inyección y Validación
+        LLM -->|JSON Output| Edits[Apply Surgical Edits]
+        Edits --> Repo
+        Edits --> TS[TypeScript Validation: npx tsc --noEmit]
+        
+        %% Auto-corrección
+        TS -->|Patch Error / TS Error| Truncate[Truncate Error & Feedback to Prompt]
+        Truncate --> LLM
+    end
+
+    %% Salida de la IA y Snapshots
+    TS -->|Success| Snap[takeSnapshot - src/snapshot.ts]
+    Snap --> Ex[Ngrok + Expo/Puppeteer Preview]
+
+    %% Interfaz de Discord y Acciones
+    Ex --> UI[Discord Reply: Screenshot, URLs & Buttons]
+
+    %% Botones de Acción
+    UI -->|Click: ✅ Approve & PR| SmartPR[generatePRMetadata: Read full diff]
+    SmartPR --> PR[createPullRequest - src/git.ts]
+    
+    UI -->|Click: 🗑️ Revert| Reset[git reset --hard & clean]
+    
+    UI -->|Click: 🛑 Cancel Task| Abort[AbortController triggers AbortError]
+    Abort --> Reset
+```
+
 Unity operates as a **tool‑driven AI system**.
 
 The AI **never directly modifies files or runs arbitrary commands**.  
