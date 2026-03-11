@@ -9,7 +9,6 @@ import { TARGET_EXPO_PATH, TARGET_API_PATH } from './git.js';
 // Long-lived process handles allow restarts between runs without zombie servers.
 let currentExpoProcess: ChildProcess | null = null;
 let currentNestProcess: ChildProcess | null = null;
-let currentNgrokProcess: ChildProcess | null = null;
 
 export interface SnapshotResult {
     snapshotPath: string | null;
@@ -18,7 +17,7 @@ export interface SnapshotResult {
     warning?: string;
 }
 
-// Selects the first non-loopback IPv4 address for LAN preview links.
+// Selects the first non-loopback IPv4 address for LAN/Proxy preview links.
 function getLocalIpAddress(): string | null {
     const interfaces = os.networkInterfaces();
     for (const name of Object.keys(interfaces)) {
@@ -31,7 +30,21 @@ function getLocalIpAddress(): string | null {
     return null;
 }
 
-// Boots backend/frontend as needed and captures a mobile viewport screenshot of the target route.
+// Injects the backend URL into Expo's environment so the mobile app knows where to point.
+function injectApiUrlToEnv(url: string) {
+    const envPath = path.join(TARGET_EXPO_PATH, '.env');
+    let envContent = '';
+    if (fs.existsSync(envPath)) {
+        envContent = fs.readFileSync(envPath, 'utf8');
+    }
+    
+    envContent = envContent.replace(/^EXPO_PUBLIC_API_URL=.*$/gm, '').trim();
+    envContent += `\nEXPO_PUBLIC_API_URL=${url}\n`;
+    fs.writeFileSync(envPath, envContent.trim() + '\n');
+    console.log(`💉 Injected EXPO_PUBLIC_API_URL=${url} into Expo App`);
+}
+
+// Boots backend/frontend locally and captures a mobile viewport screenshot of the target route.
 export async function takeSnapshot(targetRoute: string = '/'): Promise<SnapshotResult> {
     // Normalizes Expo Router file paths into a browser-safe route.
     let safeRoute = targetRoute.replace(/^\/?app\//, '/').replace(/\/\([^)]+\)/g, '').replace(/\/index\/?$/i, ''); 
@@ -42,6 +55,8 @@ export async function takeSnapshot(targetRoute: string = '/'): Promise<SnapshotR
     const port = 8081;
     const localUrl = `http://localhost:${port}${safeRoute}`;
     const ip = getLocalIpAddress();
+    
+    // Si tienes Nginx o un proxy apuntando a este server, la publicUrl puede usar la IP real del Droplet
     const mobileUrl = ip ? `http://${ip}:${port}${safeRoute}` : null;
 
     console.log(`📸 Requested route: ${targetRoute}`);
@@ -49,64 +64,20 @@ export async function takeSnapshot(targetRoute: string = '/'): Promise<SnapshotR
     // Ensure previous run processes do not conflict with required ports.
     if (currentExpoProcess) currentExpoProcess.kill();
     if (currentNestProcess) currentNestProcess.kill();
-    if (currentNgrokProcess) currentNgrokProcess.kill();
     await new Promise(r => setTimeout(r, 2000)); 
 
-    let backendNgrokUrl: string | null = null;
-    
     if (TARGET_API_PATH) {
         // API startup is optional; frontend-only repos skip this entire block.
-        console.log("🔌 Starting NestJS Backend...");
+        console.log("🔌 Starting NestJS Backend (Local Port 3000)...");
         currentNestProcess = spawn('npm', ['run', 'start'], { cwd: TARGET_API_PATH, shell: true });
         
-        console.log("🚇 Opening Ngrok Tunnel for Backend (Port 3000)...");
-        // Avoid interactive npx prompts when ngrok is not already installed.
-        currentNgrokProcess = spawn('npx', ['--yes', 'ngrok', 'http', '3000', '--log=stdout'], { shell: true });
+        // Inyectamos inmediatamente la URL del backend al frontend. 
+        // Usamos la IP local para que si abres la app en tu celular, pueda llegar al server.
+        const backendUrl = ip ? `http://${ip}:3000` : 'http://localhost:3000';
+        injectApiUrlToEnv(backendUrl);
         
-        await new Promise<void>((resolveBackend) => {
-            let isBackendResolved = false;
-
-            const processNgrokOutput = (data: any) => {
-                const output = data.toString();
-                if (output.trim()) {
-                    console.log(`[NGROK LOG] ${output.trim()}`);
-                }
-
-                const match = output.match(/url=(https:\/\/[a-zA-Z0-9-]+\.ngrok[^\s]*)/i);
-                
-                if (match && !backendNgrokUrl && !isBackendResolved) {
-                    backendNgrokUrl = match[1];
-                    console.log(`✅ Backend Tunnel Ready: ${backendNgrokUrl}`);
-                    
-                    // Persist tunnel URL so Expo can call the API from browser/mobile environments.
-                    const envPath = path.join(TARGET_EXPO_PATH, '.env');
-                    let envContent = '';
-                    if (fs.existsSync(envPath)) {
-                        envContent = fs.readFileSync(envPath, 'utf8');
-                    }
-                    
-                    envContent = envContent.replace(/^EXPO_PUBLIC_API_URL=.*$/gm, '').trim();
-                    envContent += `\nEXPO_PUBLIC_API_URL=${backendNgrokUrl}\n`;
-                    fs.writeFileSync(envPath, envContent.trim() + '\n');
-                    console.log(`💉 Injected EXPO_PUBLIC_API_URL into Expo App`);
-                    
-                    isBackendResolved = true;
-                    resolveBackend();
-                }
-            };
-
-            // Ngrok can emit the URL on stdout or stderr depending on version/platform.
-            currentNgrokProcess?.stdout?.on('data', processNgrokOutput);
-            currentNgrokProcess?.stderr?.on('data', processNgrokOutput);
-
-            setTimeout(() => {
-                if (!isBackendResolved) {
-                    console.log("⚠️ Ngrok backend tunnel timeout. Continuing without it...");
-                    isBackendResolved = true;
-                    resolveBackend();
-                }
-            }, 15000);
-        });
+        // Le damos 3 segunditos al backend para que respire antes de levantar el front
+        await new Promise(r => setTimeout(r, 3000));
     }
 
     return new Promise((resolve) => {
@@ -138,7 +109,11 @@ export async function takeSnapshot(targetRoute: string = '/'): Promise<SnapshotR
                 
                 try {
                     console.log(`🌐 Expo Server ready! Taking snapshot...`);
-                    const browser = await puppeteer.launch({ headless: true });
+                    // Banderas de seguridad críticas para correr Chromium en un Droplet de Ubuntu
+                    const browser = await puppeteer.launch({ 
+                        headless: true,
+                        args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage']
+                    });
                     const page = await browser.newPage();
                     await page.setViewport({ width: 390, height: 844, isMobile: true });
                     
