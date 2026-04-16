@@ -262,6 +262,17 @@ export class UnityStore {
         started_at TEXT,
         finished_at TEXT
       );
+
+      CREATE INDEX IF NOT EXISTS idx_tasks_run_id ON tasks(run_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
+      CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);
+      CREATE INDEX IF NOT EXISTS idx_events_task_id ON events(task_id);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_run_id ON artifacts(run_id);
+      CREATE INDEX IF NOT EXISTS idx_artifacts_task_id ON artifacts(task_id);
+      CREATE INDEX IF NOT EXISTS idx_plans_run_id ON plans(run_id);
+      CREATE INDEX IF NOT EXISTS idx_runs_status_created ON runs(status, created_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_runs_project_name ON runs(project_name);
+      CREATE INDEX IF NOT EXISTS idx_night_jobs_project ON night_jobs(project_name, status);
     `);
 
     this.ensureColumn('plans', 'status', `ALTER TABLE plans ADD COLUMN status TEXT NOT NULL DEFAULT 'proposed'`);
@@ -624,6 +635,43 @@ export class UnityStore {
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
       `)
       .run(memoryId, projectName, layer, key, content, metadata ? JSON.stringify(metadata) : null, nowIso(), nowIso());
+  }
+
+  /**
+   * Find runs that were interrupted (status = 'running' or 'healing')
+   * and could potentially be resumed.
+   */
+  listResumableRuns(): RunRecord[] {
+    const rows = this.db
+      .prepare(`SELECT * FROM runs WHERE status IN ('running', 'healing') ORDER BY created_at DESC`)
+      .all() as Record<string, unknown>[];
+
+    return rows.map(mapRun);
+  }
+
+  /**
+   * Get the count of completed tasks for a run (for checkpoint tracking).
+   */
+  getRunProgress(runId: string): { total: number; completed: number; failed: number; pending: number } {
+    const tasks = this.listTasksByRun(runId);
+    return {
+      total: tasks.length,
+      completed: tasks.filter((t) => t.status === 'succeeded' || t.status === 'skipped').length,
+      failed: tasks.filter((t) => t.status === 'failed' || t.status === 'blocked').length,
+      pending: tasks.filter((t) => t.status === 'pending' || t.status === 'running').length,
+    };
+  }
+
+  /**
+   * Reset tasks that were 'running' when the process crashed back to 'pending'
+   * so they can be retried on resume.
+   */
+  resetInterruptedTasks(runId: string): number {
+    const tasks = this.listTasksByRun(runId).filter((t) => t.status === 'running');
+    for (const task of tasks) {
+      this.updateTask(task.id, { status: 'pending', worktreePath: null, branchName: null });
+    }
+    return tasks.length;
   }
 
   createNightJob(id: string, projectName: string, prompt: string, config: NightJobConfig): void {

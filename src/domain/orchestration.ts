@@ -4,7 +4,9 @@ export type AgentRole =
   | 'executor'
   | 'reviewer'
   | 'measurer'
-  | 'memory-curator';
+  | 'memory-curator'
+  | 'explorer'
+  | 'architect';
 
 export type RunStatus =
   | 'queued'
@@ -18,7 +20,7 @@ export type RunStatus =
   | 'failed'
   | 'cancelled';
 
-export type RunMode = 'interactive' | 'nightly';
+export type RunMode = 'interactive' | 'nightly' | 'auto';
 
 export type PlanStatus = 'proposed' | 'approved' | 'rejected' | 'superseded';
 

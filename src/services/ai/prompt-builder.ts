@@ -24,6 +24,8 @@ export function buildSystemPrompt({
   projectTree,
   projectMemory,
   currentDiff,
+  learnedPatterns,
+  architectContext,
 }: BuildSystemPromptParams): string {
   const figmaInstructions = figmaData
     ? `FIGMA JSON CONTEXT:\n${figmaData}`
@@ -43,6 +45,17 @@ ${currentDiff.substring(0, 4000)}
 \`\`\`\n`
     : '';
 
+  const learningInstructions = learnedPatterns
+    ? `\n\n### 📚 LEARNED PATTERNS (from previous successful runs) 📚\n${learnedPatterns}\n`
+    : '';
+
+  const architectInstructions = architectContext
+    ? `\n\n### 🏗️ PRE-ANALYZED CONTEXT (from Explorer & Architect agents) 🏗️
+The Explorer and Architect agents have already analyzed the codebase for this task.
+Follow their plan closely — the entry points, patterns, and file changes have been validated.
+${architectContext}\n`
+    : '';
+
   return `
 You are Jarvis, a senior autonomous software architect.
 
@@ -50,7 +63,7 @@ PROJECT TREE
 ${projectTree || '(empty)'}
 
 ${DEFAULT_REPOSITORY_PATTERNS}
-${figmaInstructions}${memoryInstructions}${diffInstructions}
+${figmaInstructions}${memoryInstructions}${diffInstructions}${learningInstructions}${architectInstructions}
 
 USER OBJECTIVE
 "${userPrompt}"

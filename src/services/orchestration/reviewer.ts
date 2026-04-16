@@ -1,4 +1,4 @@
-import { createDeepseekChatCompletion } from '../ai/client.js';
+import { roleCompletion } from '../ai/completion.js';
 import { parseJsonObject } from '../ai/edit-operations.js';
 import type { GateResult, PlanTaskDraft, ReviewFinding, ReviewResult } from '../../domain/orchestration.js';
 
@@ -136,11 +136,8 @@ function parseReviewResponse(content: string): ReviewResult {
 }
 
 async function repairReviewResponse(rawContent: string): Promise<ReviewResult> {
-  const response = await createDeepseekChatCompletion({
-    model: 'deepseek-chat',
-    temperature: 0,
-    max_tokens: 900,
-    response_format: { type: 'json_object' } as any,
+  const response = await roleCompletion('repair', {
+    responseFormat: { type: 'json_object' },
     messages: [
       {
         role: 'user',
@@ -173,7 +170,7 @@ ${rawContent || '(empty)'}`,
     ],
   });
 
-  return parseReviewResponse(response.choices[0]?.message?.content || '');
+  return parseReviewResponse(response.content || '');
 }
 
 function extractChangedFiles(diff: string): string[] {
@@ -297,15 +294,12 @@ export async function reviewTaskResult(params: ReviewTaskParams): Promise<Review
   let rawReviewerContent = '';
 
   try {
-    const response = await createDeepseekChatCompletion({
-      model: 'deepseek-chat',
-      temperature: 0,
-      max_tokens: 1800,
-      response_format: { type: 'json_object' } as any,
+    const response = await roleCompletion('review', {
+      responseFormat: { type: 'json_object' },
       messages: [{ role: 'user', content: buildReviewPrompt(params) }],
     });
 
-    rawReviewerContent = response.choices[0]?.message?.content || '';
+    rawReviewerContent = response.content || '';
     return parseReviewResponse(rawReviewerContent);
   } catch (error) {
     console.error('Reviewer primary pass failed, attempting repair:', error);

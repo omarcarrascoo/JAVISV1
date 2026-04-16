@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
-import { getRuntimeConfig } from '../../config.js';
+import { execSync } from 'node:child_process';
+import { getRuntimeConfig, WORKSPACE_DIR } from '../../config.js';
 import {
   approveAutonomousRunPlan,
   rejectAutonomousRunPlan,
@@ -8,6 +9,10 @@ import {
 import { RuntimeState } from '../../runtime/state.js';
 import { unityStore } from '../../runtime/services.js';
 import { createEntityId } from '../../shared/ids.js';
+import { getTelemetryStore } from '../../services/telemetry/telemetry-store.js';
+import { getLearningStore } from '../../services/learning/learning-store.js';
+import { getKnowledgeGraph } from '../../services/knowledge/index.js';
+import { handleGitHubWebhook } from '../webhooks/index.js';
 
 type RunPayload = NonNullable<ReturnType<typeof buildRunPayload>>;
 
@@ -546,6 +551,19 @@ function buildActionsHtml(run: UiRunViewModel['run'], plan: UiRunViewModel['plan
     </div>`;
   }
 
+  if (run.status === 'failed' || run.status === 'completed_with_warnings') {
+    return `<div class="actions">
+      <button class="btn-secondary" id="rerun-failed" type="button">Re-run Failed Tasks</button>
+      <button class="btn-secondary" id="view-diff" type="button">View Diff</button>
+    </div>`;
+  }
+
+  if (run.status === 'completed') {
+    return `<div class="actions">
+      <button class="btn-secondary" id="view-diff" type="button">View Diff</button>
+    </div>`;
+  }
+
   return '';
 }
 
@@ -1054,6 +1072,26 @@ function renderRunPage(
       .input-base:focus { border-color: #52525b; }
       select.input-base { flex: 0 0 auto; padding-right: 32px; }
       textarea.input-base { min-height: 80px; resize: vertical; width: 100%; margin-bottom: 12px; }
+
+      .diff-modal-overlay {
+        display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.7); z-index: 100;
+        align-items: center; justify-content: center;
+      }
+      .diff-modal-overlay.open { display: flex; }
+      .diff-modal {
+        background: var(--bg-app); border: 1px solid var(--border); border-radius: var(--radius);
+        width: 90vw; max-width: 1000px; max-height: 85vh; display: flex; flex-direction: column;
+      }
+      .diff-modal-header {
+        display: flex; justify-content: space-between; align-items: center;
+        padding: 16px 24px; border-bottom: 1px solid var(--border);
+      }
+      .diff-modal-header h3 { margin: 0; font-size: 16px; font-weight: 500; }
+      .diff-modal-body { overflow: auto; padding: 16px 24px; flex: 1; }
+      .diff-modal-body pre { white-space: pre; overflow-x: auto; }
+      .diff-add { color: #4ade80; }
+      .diff-del { color: #f87171; }
+      .diff-hunk { color: #60a5fa; font-weight: 600; }
     </style>
   </head>
   <body>
@@ -1148,6 +1186,16 @@ function renderRunPage(
         </aside>
       </div>
     </main>
+
+    <div class="diff-modal-overlay" id="diff-overlay">
+      <div class="diff-modal">
+        <div class="diff-modal-header">
+          <h3 id="diff-title">Diff</h3>
+          <button class="btn-secondary" id="diff-close" type="button" style="padding:6px 12px;">✕ Close</button>
+        </div>
+        <div class="diff-modal-body"><pre id="diff-content">Loading...</pre></div>
+      </div>
+    </div>
 
     <script>
       const currentRunId = ${JSON.stringify(runId)};
@@ -1289,6 +1337,27 @@ function renderRunPage(
           headers:{'Content-Type':'application/json'},
           body: JSON.stringify({})
         }));
+
+        bind('rerun-failed', () => fetch('/api/runs/'+currentRunId+'/rerun-failed', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({})
+        }));
+
+        const diffBtn = document.getElementById('view-diff');
+        if(diffBtn) diffBtn.onclick = async () => {
+          const overlay = document.getElementById('diff-overlay');
+          const content = document.getElementById('diff-content');
+          const title = document.getElementById('diff-title');
+          overlay.classList.add('open');
+          content.textContent = 'Loading diff...';
+          try {
+            const r = await fetch('/api/runs/'+currentRunId+'/diff');
+            const data = await r.json();
+            title.textContent = 'Diff: ' + (data.branchName || currentRunId);
+            content.innerHTML = colorDiff(data.diff || 'No diff available');
+          } catch(e) { content.textContent = 'Error loading diff.'; }
+        };
       }
 
       function renderGraph(tasks, run) {
@@ -1423,6 +1492,18 @@ function renderRunPage(
         } catch(e) { console.error(e); }
       }
 
+      function colorDiff(raw) {
+        return safe(raw).split('\\n').map(line => {
+          if(line.startsWith('+') && !line.startsWith('+++')) return '<span class="diff-add">'+line+'</span>';
+          if(line.startsWith('-') && !line.startsWith('---')) return '<span class="diff-del">'+line+'</span>';
+          if(line.startsWith('@@')) return '<span class="diff-hunk">'+line+'</span>';
+          return line;
+        }).join('\\n');
+      }
+
+      document.getElementById('diff-close').onclick = () => document.getElementById('diff-overlay').classList.remove('open');
+      document.getElementById('diff-overlay').onclick = (e) => { if(e.target.id==='diff-overlay') e.target.classList.remove('open'); };
+
       document.getElementById('task-search').addEventListener('input', e => { taskSearch = e.target.value.toLowerCase(); renderAll(); });
       document.getElementById('task-status-filter').addEventListener('change', e => { taskStatusFilter = e.target.value; renderAll(); });
 
@@ -1456,6 +1537,11 @@ export function startUnityHttpServer(runtime: RuntimeState) {
     try {
       if (req.method === 'GET' && pathname === '/health') {
         sendJson(res, 200, { ok: true });
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/webhooks/github') {
+        await handleGitHubWebhook(req, res, runtime);
         return;
       }
 
@@ -1656,6 +1742,177 @@ export function startUnityHttpServer(runtime: RuntimeState) {
         }
 
         sendJson(res, 202, { ok: true, message: 'Abort requested.' });
+        return;
+      }
+
+      /* ── Telemetry / Cost Dashboard API ── */
+
+      if (req.method === 'GET' && extractRunId(pathname, '/cost')) {
+        const runId = extractRunId(pathname, '/cost') as string;
+        const telemetryStore = getTelemetryStore();
+        const summary = telemetryStore.getRunCostSummary(runId);
+        const taskCosts = telemetryStore.getTaskCosts(runId);
+        sendJson(res, 200, { summary, taskCosts });
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/telemetry/stats') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const days = Number(url.searchParams.get('days') || 30);
+        const telemetryStore = getTelemetryStore();
+        sendJson(res, 200, telemetryStore.getProjectStats(projectName, days));
+        return;
+      }
+
+      if (req.method === 'GET' && extractRunId(pathname, '/telemetry')) {
+        const runId = extractRunId(pathname, '/telemetry') as string;
+        const limit = Number(url.searchParams.get('limit') || 200);
+        const telemetryStore = getTelemetryStore();
+        sendJson(res, 200, telemetryStore.listEventsByRun(runId, limit));
+        return;
+      }
+
+      /* ── Learning API ── */
+
+      if (req.method === 'GET' && pathname === '/api/learning/patterns') {
+        const limit = Number(url.searchParams.get('limit') || 20);
+        const learningStore = getLearningStore();
+        sendJson(res, 200, learningStore.getTopPatterns(limit));
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/learning/stats') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const learningStore = getLearningStore();
+        sendJson(res, 200, learningStore.getProjectLearningStats(projectName));
+        return;
+      }
+
+      /* ── Diff Viewer API ── */
+
+      if (req.method === 'GET' && extractRunId(pathname, '/diff')) {
+        const runId = extractRunId(pathname, '/diff') as string;
+        const run = unityStore.getRun(runId);
+        if (!run) {
+          sendJson(res, 404, { error: `Run ${runId} not found.` });
+          return;
+        }
+
+        try {
+          const repoDir = `${WORKSPACE_DIR}/${run.projectName}`;
+          const diff = execSync(
+            `git diff ${run.defaultBranch}...${run.branchName} 2>/dev/null || git diff HEAD~1 2>/dev/null || echo "No diff available"`,
+            { cwd: repoDir, maxBuffer: 5 * 1024 * 1024, timeout: 10000 },
+          ).toString();
+          sendJson(res, 200, { runId, branchName: run.branchName, diff });
+        } catch {
+          sendJson(res, 200, { runId, branchName: run.branchName, diff: 'Unable to generate diff.' });
+        }
+        return;
+      }
+
+      /* ── Re-run Failed Tasks API ── */
+
+      if (req.method === 'POST' && extractRunId(pathname, '/rerun-failed')) {
+        const runId = extractRunId(pathname, '/rerun-failed') as string;
+        const run = unityStore.getRun(runId);
+        if (!run) {
+          sendJson(res, 404, { error: `Run ${runId} not found.` });
+          return;
+        }
+
+        const failedTasks = unityStore.listTasksByRun(runId).filter((t) => t.status === 'failed');
+        if (failedTasks.length === 0) {
+          sendJson(res, 200, { ok: true, message: 'No failed tasks to re-run.', resetCount: 0 });
+          return;
+        }
+
+        for (const task of failedTasks) {
+          unityStore.updateTask(task.id, { status: 'pending', attempts: 0 });
+        }
+
+        if (run.status === 'failed' || run.status === 'completed_with_warnings') {
+          unityStore.updateRun(runId, { status: 'running', finishedAt: null });
+        }
+
+        sendJson(res, 200, {
+          ok: true,
+          message: `Reset ${failedTasks.length} failed task(s) to pending.`,
+          resetCount: failedTasks.length,
+          taskIds: failedTasks.map((t) => t.id),
+        });
+        return;
+      }
+
+      /* ── Task Timeline API ── */
+
+      if (req.method === 'GET' && extractRunId(pathname, '/timeline')) {
+        const runId = extractRunId(pathname, '/timeline') as string;
+        const tasks = unityStore.listTasksByRun(runId);
+        const events = unityStore.listEventsByRun(runId);
+
+        const timeline = tasks
+          .filter((t) => t.startedAt)
+          .map((t) => ({
+            taskId: t.id,
+            title: t.title,
+            status: t.status,
+            startedAt: t.startedAt,
+            finishedAt: t.finishedAt,
+            durationMs:
+              t.startedAt && t.finishedAt
+                ? new Date(t.finishedAt).getTime() - new Date(t.startedAt).getTime()
+                : null,
+          }))
+          .sort((a, b) => new Date(a.startedAt!).getTime() - new Date(b.startedAt!).getTime());
+
+        sendJson(res, 200, { runId, timeline, eventCount: events.length });
+        return;
+      }
+
+      /* ── Knowledge Graph API ── */
+
+      if (req.method === 'GET' && pathname === '/api/knowledge/snapshot') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const kg = getKnowledgeGraph();
+        sendJson(res, 200, kg.getProjectSnapshot(projectName));
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/knowledge/hot-files') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const limit = Number(url.searchParams.get('limit') || 20);
+        const kg = getKnowledgeGraph();
+        sendJson(res, 200, kg.getHotFiles(projectName, limit));
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/knowledge/fragile') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const kg = getKnowledgeGraph();
+        sendJson(res, 200, kg.getFragileAreas(projectName));
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/api/knowledge/decisions') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const kg = getKnowledgeGraph();
+        sendJson(res, 200, kg.listDecisions(projectName));
+        return;
+      }
+
+      if (req.method === 'POST' && pathname === '/api/knowledge/decisions') {
+        const body = await readJsonBody(req);
+        const projectName = (body.project as string) || getRuntimeConfig().githubRepo;
+        const kg = getKnowledgeGraph();
+        const id = kg.addDecision({
+          projectName,
+          title: String(body.title || ''),
+          description: String(body.description || ''),
+          context: String(body.context || ''),
+          affectedPaths: Array.isArray(body.affectedPaths) ? body.affectedPaths : [],
+        });
+        sendJson(res, 201, { ok: true, id });
         return;
       }
 

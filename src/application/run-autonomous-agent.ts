@@ -31,6 +31,9 @@ import { planAutonomousRun } from '../services/orchestration/planner.js';
 import { getProjectPolicy } from '../services/orchestration/policy-engine.js';
 import { reviewTaskResult } from '../services/orchestration/reviewer.js';
 import { createTaskWorktree, removeTaskWorktree } from '../services/orchestration/worktree-manager.js';
+import { buildLearningContext, extractPattern, recordPatternOutcomes } from '../services/learning/index.js';
+import { runAgentPipeline } from '../services/ai/agent-roles.js';
+import { getKnowledgeGraph } from '../services/knowledge/index.js';
 
 interface RunAutonomousAgentParams {
   project: WorkspaceProject;
@@ -244,6 +247,18 @@ function getOutOfScopePaths(workspace: PreparedWorkspace, diff: string, scopes: 
   });
 }
 
+function extractEditedFiles(diff: string): string[] {
+  return Array.from(
+    new Set(
+      diff
+        .split('\n')
+        .filter((line) => line.startsWith('+++ b/'))
+        .map((line) => line.replace('+++ b/', '').trim())
+        .filter((filePath) => filePath && filePath !== '/dev/null'),
+    ),
+  );
+}
+
 function buildScopedTaskPrompt(
   task: TaskRecord,
   runPrompt: string,
@@ -442,7 +457,7 @@ async function executeTask(
   options?: { inClosingWindow?: boolean; remainingMs?: number },
   onProgress?: (message: string) => Promise<void>,
 ): Promise<ExecutedTaskResult> {
-  const taskWorktree = await createTaskWorktree(baseWorkspace, run.id, task.id, run.branchName);
+  const taskWorktree = await createTaskWorktree(baseWorkspace, run.id, task.id, run.branchName, task.writeScope);
   unityStore.updateTask(task.id, {
     status: 'running',
     attempts: task.attempts + 1,
@@ -457,6 +472,52 @@ async function executeTask(
     }
     const baselineStaticGates = await runStaticGates(taskWorktree.workspace, policy, task.writeScope);
     const projectTree = getProjectTree(taskWorktree.workspace.repoPath);
+
+    // Build learning context from past successful patterns
+    const learningContext = buildLearningContext({
+      projectName: run.projectName,
+      taskKind: task.kind,
+      taskTitle: task.title,
+      taskPrompt: task.prompt,
+      writeScope: task.writeScope,
+    });
+
+    if (learningContext.appliedPatternIds.length > 0 && onProgress) {
+      await onProgress(`📚 [${task.title}] Injecting ${learningContext.appliedPatternIds.length} learned pattern(s).`);
+    }
+
+    // Run Explorer → Architect pipeline for richer context
+    let architectContext: string | null = null;
+    try {
+      if (onProgress) {
+        await onProgress(`🔍 [${task.title}] Running Explorer → Architect pipeline...`);
+      }
+      const pipeline = await runAgentPipeline({
+        repoPath: taskWorktree.workspace.repoPath,
+        userPrompt: buildScopedTaskPrompt(task, run.prompt, dependencyContext, options),
+        projectTree,
+        projectMemory,
+        projectName: run.projectName,
+        writeScope: task.writeScope,
+        signal,
+        onProgress: onProgress ? (msg) => onProgress(`🤖 [${task.title}] ${msg}`) : undefined,
+        runId: run.id,
+        taskId: task.id,
+      });
+      architectContext = pipeline.implementerContext;
+      if (onProgress) {
+        await onProgress(
+          `📐 [${task.title}] Pipeline complete: ${pipeline.explorationReport.entryPoints.length} entry points, ${pipeline.architectPlan.fileChanges.length} planned changes`,
+        );
+      }
+    } catch (pipelineError: any) {
+      // Pipeline is non-blocking — fall back to direct implementation
+      console.warn(`[unity] Explorer/Architect pipeline failed for task ${task.id}:`, pipelineError.message);
+      if (onProgress) {
+        await onProgress(`⚠️ [${task.title}] Explorer/Architect pipeline skipped, proceeding with direct implementation.`);
+      }
+    }
+
     const execution = await generateAndWriteCode({
       repoPath: taskWorktree.workspace.repoPath,
       userPrompt: buildScopedTaskPrompt(task, run.prompt, dependencyContext, options),
@@ -464,7 +525,11 @@ async function executeTask(
       projectTree,
       projectMemory,
       currentDiff: null,
+      learnedPatterns: learningContext.promptSection || null,
+      architectContext,
       signal,
+      runId: run.id,
+      taskId: task.id,
       onStatusUpdate: (status, thought) => {
         if (!onProgress) return;
         return onProgress(`🧩 [${task.title}] ${status}${thought ? `\n> ${thought}` : ''}`);
@@ -538,6 +603,40 @@ async function executeTask(
     const status: TaskExecutionOutcome['status'] =
       !commitSha ? 'skipped' : hasFailedGate || !review.approved ? 'failed' : 'succeeded';
 
+    // Learning loop: record outcomes for applied patterns
+    if (learningContext.appliedPatternIds.length > 0) {
+      recordPatternOutcomes({
+        appliedPatternIds: learningContext.appliedPatternIds,
+        taskId: task.id,
+        runId: run.id,
+        succeeded: status === 'succeeded',
+        iterations: 0, // Not tracked at this level
+        tokensUsed: execution.tokenUsage,
+      });
+    }
+
+    // Learning loop: extract new pattern from successful tasks
+    if (status === 'succeeded' && commitSha) {
+      extractPattern({
+        runId: run.id,
+        taskId: task.id,
+        projectName: run.projectName,
+        taskTitle: task.title,
+        taskKind: task.kind,
+        taskPrompt: task.prompt,
+        writeScope: task.writeScope,
+        iterations: 0, // Would need to track from agent-runner
+        tokensUsed: execution.tokenUsage,
+        filesRead: [], // Would need tool history from agent-runner
+        filesEdited: extractEditedFiles(diff),
+        toolHistory: [],
+        commitMessage: execution.commitMessage,
+        gateResults: staticGates.map((g) => ({ name: g.name, status: g.status })),
+      }).catch((err) => {
+        console.warn(`📚 Pattern extraction failed for task ${task.id}:`, err?.message);
+      });
+    }
+
     return {
       task,
       diff,
@@ -570,7 +669,20 @@ async function integrateTaskResult(
   }
 
   await checkoutBranch(baseWorkspace.repoPath, run.branchName);
-  await cherryPickCommit(baseWorkspace.repoPath, executedTask.outcome.commitSha);
+
+  const result = await cherryPickCommit(baseWorkspace.repoPath, executedTask.outcome.commitSha);
+
+  if (!result.success) {
+    const detail = result.conflicting
+      ? `Cherry-pick conflict in ${result.conflictFiles.length} file(s): ${result.conflictFiles.join(', ')}`
+      : result.error || 'Cherry-pick failed for unknown reason';
+    throw new Error(detail);
+  }
+
+  if (result.conflicting && result.conflictFiles.length > 0) {
+    console.log(`🔧 Auto-resolved conflicts during integration of task commit: ${result.conflictFiles.join(', ')}`);
+  }
+
   await pushBranch(baseWorkspace.repoPath, run.branchName);
 }
 
@@ -1223,6 +1335,34 @@ async function executeApprovedRun(
     null,
   );
 
+  // Update Knowledge Graph with file changes from this run
+  try {
+    const knowledgeGraph = getKnowledgeGraph();
+    const changedFiles: Array<{ path: string; taskId?: string; gatePassed: boolean }> = [];
+    for (const task of tasks) {
+      if (task.commitSha) {
+        const taskGatePassed = task.status === 'succeeded';
+        const taskFiles = task.outputSummary
+          ? extractEditedFiles(task.outputSummary)
+          : [];
+        // If no files from summary, use writeScope as proxy
+        const filePaths = taskFiles.length > 0 ? taskFiles : task.writeScope;
+        for (const fp of filePaths) {
+          changedFiles.push({ path: fp, taskId: task.id, gatePassed: taskGatePassed });
+        }
+      }
+    }
+    if (changedFiles.length > 0) {
+      knowledgeGraph.updateAfterRun({
+        projectName: project.name,
+        runId: run.id,
+        changedFiles,
+      });
+    }
+  } catch (kgError) {
+    console.warn('[unity] Knowledge graph update failed:', kgError);
+  }
+
   unityStore.updateRun(run.id, {
     status: closure.status,
     finishedAt: nowIso(),
@@ -1512,6 +1652,30 @@ export async function resumeAutonomousRun({
     );
   }
 
+  // ── Checkpoint recovery: reset interrupted tasks ──
+  const isResumeFromCrash = run.status === 'running' || run.status === 'healing';
+  if (isResumeFromCrash) {
+    const resetCount = unityStore.resetInterruptedTasks(run.id);
+    const progress = unityStore.getRunProgress(run.id);
+
+    if (resetCount > 0 || progress.completed > 0) {
+      unityStore.addEvent(
+        createEntityId('event'),
+        run.id,
+        null,
+        'info',
+        'run.checkpoint_resume',
+        `Resuming from checkpoint: ${progress.completed} tasks already completed, ${resetCount} interrupted tasks reset to pending, ${progress.pending} tasks remaining.`,
+      );
+
+      if (onProgress) {
+        await onProgress(
+          `🔄 Resuming from checkpoint: ${progress.completed} tasks done, ${resetCount} reset, ${progress.pending} remaining.`,
+        );
+      }
+    }
+  }
+
   unityStore.updateRun(run.id, {
     status: 'running',
     finishedAt: null,
@@ -1522,7 +1686,7 @@ export async function resumeAutonomousRun({
     null,
     'info',
     'run.resumed',
-    'Run resumed after plan approval.',
+    isResumeFromCrash ? 'Run resumed from crash checkpoint.' : 'Run resumed after plan approval.',
   );
 
   if (onProgress) {
@@ -1539,6 +1703,25 @@ export async function resumeAutonomousRun({
     signal,
     onProgress,
   );
+}
+
+/**
+ * Scan for runs that were interrupted by a crash and can be resumed.
+ */
+export function listResumableRuns(): Array<{
+  runId: string;
+  projectName: string;
+  prompt: string;
+  progress: { total: number; completed: number; failed: number; pending: number };
+}> {
+  const runs = unityStore.listResumableRuns();
+
+  return runs.map((run) => ({
+    runId: run.id,
+    projectName: run.projectName,
+    prompt: run.prompt,
+    progress: unityStore.getRunProgress(run.id),
+  }));
 }
 
 export async function runAutonomousAgent(

@@ -21,11 +21,20 @@ export interface BuildSystemPromptParams {
   projectTree: string;
   projectMemory: string | null;
   currentDiff: string | null;
+  /** Learned patterns from previous successful runs (injected by learning loop) */
+  learnedPatterns?: string | null;
+  /** Pre-computed context from the Explorer→Architect pipeline */
+  architectContext?: string | null;
 }
 
 export interface GenerateCodeParams extends BuildSystemPromptParams {
   repoPath: string;
   onStatusUpdate?: (status: string, thought?: string) => void;
   signal?: AbortSignal;
+  /** For token budget tracking */
+  runId?: string;
+  taskId?: string;
+  /** Pre-computed context from the Explorer→Architect pipeline */
+  architectContext?: string | null;
 }
 

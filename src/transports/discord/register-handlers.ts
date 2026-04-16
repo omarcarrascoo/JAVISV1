@@ -14,13 +14,29 @@ import { runDevelopmentTask } from '../../application/run-development-task.js';
 import { initProject } from '../../application/projects/init-project.js';
 import { rejectSession } from '../../application/reject-session.js';
 import { getProjectByName, getRuntimeConfig } from '../../config.js';
+import type { AutonomousRunPolicy } from '../../domain/policies.js';
 import { RuntimeState } from '../../runtime/state.js';
 import { unityStore } from '../../runtime/services.js';
 import { getRepositoryStatus, prepareWorkspace } from '../../git.js';
-import { getProjectPolicy, normalizePolicy } from '../../services/orchestration/policy-engine.js';
+import {
+  getProjectPolicy,
+  normalizePolicy,
+  applyPolicyPreset,
+  isPolicyPreset,
+} from '../../services/orchestration/policy-engine.js';
+import { getTelemetryStore } from '../../services/telemetry/telemetry-store.js';
+import { getLearningStore } from '../../services/learning/learning-store.js';
 
 const runtimeConfig = getRuntimeConfig();
 const DISCORD_CONTENT_LIMIT = 3800;
+
+function formatElapsed(startMs: number): string {
+  const seconds = Math.floor((Date.now() - startMs) / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = seconds % 60;
+  return `${minutes}m ${remainingSeconds}s`;
+}
 
 function formatAgentStatus(statusMsg: string, thought?: string): string {
   let logMessage = `**${statusMsg}**`;
@@ -159,6 +175,7 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
       });
 
       try {
+        const runStartMs = Date.now();
         const result = await createAutonomousRunPlan({
           project,
           prompt: message.content,
@@ -166,7 +183,8 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
           mode: 'interactive',
           signal: abortController.signal,
           onProgress: async (progressMessage) => {
-            await thread.send(progressMessage).catch(() => {});
+            const elapsed = formatElapsed(runStartMs);
+            await thread.send(`⏱ \`${elapsed}\` — ${progressMessage}`).catch(() => {});
           },
         });
 
@@ -423,9 +441,33 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
       const { commandName } = interaction;
 
       if (commandName === 'status') {
-        const projectPolicy = getProjectPolicy(unityStore, runtime.getActiveProjectName());
+        const projectName = runtime.getActiveProjectName();
+        const projectPolicy = getProjectPolicy(unityStore, projectName);
+        const queueMetrics = runtime.getQueueMetrics();
+        const activeRunIds = runtime.getActiveRunIds();
+
+        const runLines = activeRunIds.length
+          ? activeRunIds.map((id) => `  \`${id.slice(0, 12)}\``).join('\n')
+          : '  None';
+
         await interaction.reply(
-          `🤖 **Estado Actual:**\nJarvis está enfocado en el repositorio: \`${runtime.getActiveProjectName()}\`\nProcesando tarea: ${runtime.isProcessing() ? 'Sí 🔴' : 'No 🟢'}\nCanal manual: \`#${runtimeConfig.manualChannelName}\`\nCanal autónomo: \`#${runtimeConfig.autonomousChannelName}\`\nConsola local: \`http://localhost:${runtimeConfig.localConsolePort}\`\nBranch autónoma: \`${projectPolicy.integrationBranchName}\`\nAutoapprove nightly plan: \`${projectPolicy.autoApprovePlan ? 'on' : 'off'}\`\nParalelismo: \`${projectPolicy.maxParallelTasks}\` | Retries: \`${projectPolicy.maxRetriesPerTask}\` | Horas: \`${projectPolicy.maxHours}\` | Commits: \`${projectPolicy.maxCommits}\``,
+          [
+            '🤖 **Unity Agent Status**',
+            `📂 Project: \`${projectName}\``,
+            `🔴 Processing: ${runtime.isProcessing() ? `Yes (${queueMetrics.activeRuns} run(s))` : 'No 🟢'}`,
+            `📊 Queue: \`${queueMetrics.queueRunning}/${queueMetrics.queueMaxConcurrency}\` running, \`${queueMetrics.queuePending}\` pending`,
+            `🔄 Active runs:\n${runLines}`,
+            '',
+            `📡 Manual: \`#${runtimeConfig.manualChannelName}\` | Autonomous: \`#${runtimeConfig.autonomousChannelName}\``,
+            `🌐 Console: \`http://localhost:${runtimeConfig.localConsolePort}\``,
+            '',
+            '⚙️ **Policy**',
+            `Branch: \`${projectPolicy.integrationBranchName}\``,
+            `Auto-approve: \`${projectPolicy.autoApprovePlan ? 'on' : 'off'}\``,
+            `Parallelism: \`${projectPolicy.maxParallelTasks}\` | Retries: \`${projectPolicy.maxRetriesPerTask}\` | Hours: \`${projectPolicy.maxHours}\` | Commits: \`${projectPolicy.maxCommits}\``,
+            `Token budget: \`${(projectPolicy.maxTokensPerRun / 1_000_000).toFixed(1)}M/run\` | \`${(projectPolicy.maxTokensPerTask / 1_000).toFixed(0)}K/task\``,
+            `Gates: typecheck=\`${projectPolicy.gates.runTypecheck}\` lint=\`${projectPolicy.gates.runLint}\` test=\`${projectPolicy.gates.runTests}\` security=\`${projectPolicy.gates.runSecurityScan}\``,
+          ].join('\n'),
         );
         return;
       }
@@ -433,22 +475,100 @@ export function registerDiscordHandlers(client: Client, runtime: RuntimeState): 
       if (commandName === 'policy') {
         const projectName = runtime.getActiveProjectName();
         const currentPolicy = getProjectPolicy(unityStore, projectName);
-        const updatedPolicy = normalizePolicy({
-          ...currentPolicy,
-          maxHours: interaction.options.getInteger('hours') ?? currentPolicy.maxHours,
-          maxCommits: interaction.options.getInteger('commits') ?? currentPolicy.maxCommits,
-          maxParallelTasks: interaction.options.getInteger('parallel') ?? currentPolicy.maxParallelTasks,
-          maxRetriesPerTask: interaction.options.getInteger('retries') ?? currentPolicy.maxRetriesPerTask,
-          maxImprovementCycles:
-            interaction.options.getInteger('improvements') ?? currentPolicy.maxImprovementCycles,
-          autoApprovePlan:
-            interaction.options.getBoolean('autoapproveplan') ?? currentPolicy.autoApprovePlan,
-        });
+
+        // Check for preset first
+        const presetValue = interaction.options.getString('preset');
+        let updatedPolicy: AutonomousRunPolicy;
+        let presetLabel = '';
+
+        if (presetValue && isPolicyPreset(presetValue)) {
+          updatedPolicy = applyPolicyPreset(currentPolicy, presetValue);
+          presetLabel = ` (preset: **${presetValue}**)`;
+        } else {
+          updatedPolicy = normalizePolicy({
+            ...currentPolicy,
+            maxHours: interaction.options.getInteger('hours') ?? currentPolicy.maxHours,
+            maxCommits: interaction.options.getInteger('commits') ?? currentPolicy.maxCommits,
+            maxParallelTasks: interaction.options.getInteger('parallel') ?? currentPolicy.maxParallelTasks,
+            maxRetriesPerTask: interaction.options.getInteger('retries') ?? currentPolicy.maxRetriesPerTask,
+            maxImprovementCycles:
+              interaction.options.getInteger('improvements') ?? currentPolicy.maxImprovementCycles,
+            autoApprovePlan:
+              interaction.options.getBoolean('autoapproveplan') ?? currentPolicy.autoApprovePlan,
+          });
+        }
 
         unityStore.upsertPolicy(projectName, updatedPolicy);
 
         await interaction.reply(
-          `⚙️ **Política actualizada para \`${projectName}\`**\nBranch: \`${updatedPolicy.integrationBranchName}\`\nAutoapprove nightly plan: \`${updatedPolicy.autoApprovePlan ? 'on' : 'off'}\`\nHoras: \`${updatedPolicy.maxHours}\`\nCommits: \`${updatedPolicy.maxCommits}\`\nParalelismo: \`${updatedPolicy.maxParallelTasks}\`\nRetries: \`${updatedPolicy.maxRetriesPerTask}\`\nSelf-improvement cycles: \`${updatedPolicy.maxImprovementCycles}\``,
+          [
+            `⚙️ **Policy updated for \`${projectName}\`**${presetLabel}`,
+            `Branch: \`${updatedPolicy.integrationBranchName}\``,
+            `Auto-approve: \`${updatedPolicy.autoApprovePlan ? 'on' : 'off'}\``,
+            `Hours: \`${updatedPolicy.maxHours}\` | Commits: \`${updatedPolicy.maxCommits}\``,
+            `Parallelism: \`${updatedPolicy.maxParallelTasks}\` | Retries: \`${updatedPolicy.maxRetriesPerTask}\` | Improvements: \`${updatedPolicy.maxImprovementCycles}\``,
+            `Token budget: \`${(updatedPolicy.maxTokensPerRun / 1_000_000).toFixed(1)}M/run\` | \`${(updatedPolicy.maxTokensPerTask / 1_000).toFixed(0)}K/task\``,
+            '',
+            '💡 Presets: `/policy preset:conservative|balanced|aggressive`',
+          ].join('\n'),
+        );
+        return;
+      }
+
+      if (commandName === 'cost') {
+        const runId = interaction.options.getString('run');
+        if (!runId) {
+          await interaction.reply({ content: '❌ Please provide a run ID: `/cost run:<id>`', ephemeral: true });
+          return;
+        }
+        const telemetryStore = getTelemetryStore();
+        const summary = telemetryStore.getRunCostSummary(runId);
+        if (!summary) {
+          await interaction.reply({ content: `❌ No telemetry found for run \`${runId}\`.`, ephemeral: true });
+          return;
+        }
+        const modelLines = summary.modelBreakdown
+          .map((m) => `  \`${m.model}\`: ${m.tokens.toLocaleString()} tokens ($${m.costUsd.toFixed(4)})`)
+          .join('\n');
+        await interaction.reply(
+          [
+            `💰 **Cost Summary for \`${runId.slice(0, 12)}\`**`,
+            `Total tokens: \`${summary.totalTokens.toLocaleString()}\``,
+            `Estimated cost: \`$${summary.totalCostUsd.toFixed(4)}\``,
+            `Tasks: \`${summary.taskCount}\` | Avg tokens/task: \`${summary.avgTokensPerTask.toLocaleString()}\``,
+            '',
+            '**Model breakdown:**',
+            modelLines || '  No model data',
+          ].join('\n'),
+        );
+        return;
+      }
+
+      if (commandName === 'learning') {
+        const projectName = runtime.getActiveProjectName();
+        const learningStore = getLearningStore();
+        const stats = learningStore.getProjectLearningStats(projectName);
+        const topPatterns = learningStore.getTopPatterns(5);
+
+        const patternLines = topPatterns.length
+          ? topPatterns
+              .map(
+                (p, i) =>
+                  `${i + 1}. **${p.taskKind}** (${p.filePattern || '*'}) — score: \`${p.effectivenessScore.toFixed(2)}\` | applied: \`${p.timesApplied}\``,
+              )
+              .join('\n')
+          : '  No patterns learned yet.';
+
+        await interaction.reply(
+          [
+            `🧠 **Learning Stats for \`${projectName}\`**`,
+            `Patterns: \`${stats.totalPatterns}\` total, \`${stats.effectivePatterns}\` effective`,
+            `Applications: \`${stats.totalApplications}\``,
+            `Success rate: \`${(stats.overallSuccessRate * 100).toFixed(1)}%\``,
+            '',
+            '**Top patterns:**',
+            patternLines,
+          ].join('\n'),
         );
         return;
       }

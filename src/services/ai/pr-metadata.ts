@@ -1,4 +1,4 @@
-import { createDeepseekChatCompletion } from './client.js';
+import { roleCompletion } from './completion.js';
 
 export async function generatePRMetadata(diff: string): Promise<string> {
   const prompt = `You are an expert developer. I will provide you with a git diff of the work done in this session.
@@ -9,14 +9,11 @@ GIT DIFF:
 ${diff.substring(0, 6000)}`;
 
   try {
-    const response = await createDeepseekChatCompletion({
-      model: 'deepseek-reasoner',
+    const response = await roleCompletion('pr-metadata', {
       messages: [{ role: 'user', content: prompt }],
-      temperature: 0.3,
-      max_tokens: 500,
     });
 
-    return response.choices[0]?.message?.content?.trim() || 'feat: accumulated session updates';
+    return response.content?.trim() || 'feat: accumulated session updates';
   } catch (error) {
     console.error('Error generating Smart PR:', error);
     return 'feat: accumulated session updates';

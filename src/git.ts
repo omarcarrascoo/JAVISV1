@@ -1,12 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
+import { exec, execFile } from 'child_process';
 import util from 'util';
 import { getRuntimeConfig } from './config.js';
 import type { PreparedWorkspace, WorkspaceProject } from './domain/runtime.js';
 import { initFullstackProject } from './templates.js';
 
 const execPromise = util.promisify(exec);
+const execFilePromise = util.promisify(execFile);
 
 interface WorkspaceTargets {
   expoPath: string;
@@ -200,15 +201,14 @@ export async function createPullRequest(
   commitMessage: string,
 ): Promise<string> {
   const branchName = `jarvis-${featureName}`;
-  const safeCommitMsg = commitMessage.replace(/"/g, '\\"');
   const config = getRuntimeConfig();
 
   try {
-    await execPromise(`git remote set-url origin "${getRepoUrl(workspace)}"`, { cwd: workspace.repoPath }).catch(() => {});
-    await execPromise(`git checkout -b ${branchName}`, { cwd: workspace.repoPath });
-    await execPromise(`git add .`, { cwd: workspace.repoPath });
-    await execPromise(`git commit -m "${safeCommitMsg}"`, { cwd: workspace.repoPath });
-    await execPromise(`git push origin ${branchName}`, { cwd: workspace.repoPath });
+    await execFilePromise('git', ['remote', 'set-url', 'origin', getRepoUrl(workspace)], { cwd: workspace.repoPath }).catch(() => {});
+    await execFilePromise('git', ['checkout', '-b', branchName], { cwd: workspace.repoPath });
+    await execFilePromise('git', ['add', '.'], { cwd: workspace.repoPath });
+    await execFilePromise('git', ['commit', '-m', commitMessage], { cwd: workspace.repoPath });
+    await execFilePromise('git', ['push', 'origin', branchName], { cwd: workspace.repoPath });
 
     const prResponse = await fetch(
       `https://api.github.com/repos/${config.githubOwner}/${workspace.name}/pulls`,
