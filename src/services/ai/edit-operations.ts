@@ -273,8 +273,12 @@ export function applyEditsToFiles(repoPath: string, edits: FileEdit[]): string[]
       }
     }
 
+    // Include current file content snippet so the agent can see what's actually there
+    const contentPreview = content.length > 1500
+      ? content.substring(0, 1500) + '\n... (truncated)'
+      : content;
     patchErrors.push(
-      `⚠️ Error in ${edit.filepath}: Exact 'search' block not found (fuzzy match also failed). You must match the current file content. Use read_file to verify the exact content before patching.`,
+      `⚠️ Error in ${edit.filepath}: Exact 'search' block not found (fuzzy match also failed). The file exists but its content does not match your search block.\n\nCURRENT FILE CONTENT:\n\`\`\`\n${contentPreview}\n\`\`\`\n\nRewrite your 'search' block to match the ACTUAL content above.`,
     );
     break;
   }

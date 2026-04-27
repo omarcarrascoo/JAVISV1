@@ -61,7 +61,10 @@ export async function ensureIntegrationBranch(
   workspace: PreparedWorkspace,
   integrationBranch = getRuntimeConfig().integrationBranchName,
 ): Promise<IntegrationBranchState> {
-  await tryGitCommand('git fetch origin --prune', workspace.repoPath);
+  await withRetry(
+    () => tryGitCommand('git fetch origin --prune', workspace.repoPath).then(() => {}),
+    { label: 'git fetch origin --prune' },
+  );
   const defaultBranch = await detectDefaultBranch(workspace.repoPath);
   const hasRemoteBranch = await remoteBranchExists(workspace.repoPath, integrationBranch);
   const hasLocalBranch = await localBranchExists(workspace.repoPath, integrationBranch);
@@ -86,7 +89,10 @@ export async function ensureIntegrationBranch(
     await execPromise(`git checkout -B ${integrationBranch}`, { cwd: workspace.repoPath });
   }
 
-  await execPromise(`git push -u origin ${integrationBranch}`, { cwd: workspace.repoPath });
+  await withRetry(
+    () => execPromise(`git push -u origin ${integrationBranch}`, { cwd: workspace.repoPath }).then(() => {}),
+    { label: `git push -u origin ${integrationBranch}` },
+  );
 
   return {
     defaultBranch,
@@ -230,11 +236,66 @@ async function tryAutoResolveConflicts(repoPath: string, conflictFiles: string[]
 }
 
 /* ────────────────────────────────────────────────────────────
+   Retry helper for transient network errors
+   ──────────────────────────────────────────────────────────── */
+
+const TRANSIENT_ERROR_PATTERNS = [
+  'SSL_ERROR',
+  'SSL_CONNECT',
+  'Could not resolve host',
+  'Connection refused',
+  'Connection reset',
+  'Connection timed out',
+  'timed out',
+  'Unable to access',
+  'The requested URL returned error: 5',
+  'EOF',
+  'early EOF',
+  'ETIMEDOUT',
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ENOTFOUND',
+  'fetch first',           // remote has new commits — not transient, but retryable after fetch
+];
+
+function isTransientGitError(error: unknown): boolean {
+  const msg = error instanceof Error ? error.message : String(error);
+  return TRANSIENT_ERROR_PATTERNS.some((pat) => msg.includes(pat));
+}
+
+async function withRetry<T>(
+  fn: () => Promise<T>,
+  { retries = 3, label = 'git operation' }: { retries?: number; label?: string } = {},
+): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      if (attempt < retries && isTransientGitError(error)) {
+        const backoffMs = Math.pow(3, attempt - 1) * 1000; // 1s, 3s, 9s
+        console.warn(
+          `⚠️ ${label} failed (attempt ${attempt}/${retries}), retrying in ${backoffMs / 1000}s: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        await new Promise((resolve) => setTimeout(resolve, backoffMs));
+        continue;
+      }
+      throw error; // permanent error or last attempt — propagate
+    }
+  }
+  throw lastError; // unreachable, but satisfies TS
+}
+
+/* ────────────────────────────────────────────────────────────
    Standard operations
    ──────────────────────────────────────────────────────────── */
 
 export async function pushBranch(repoPath: string, branchName: string): Promise<void> {
-  await execPromise(`git push origin ${branchName}`, { cwd: repoPath });
+  await withRetry(
+    () => execPromise(`git push origin ${branchName}`, { cwd: repoPath }).then(() => {}),
+    { label: `git push origin ${branchName}` },
+  );
 }
 
 export async function checkoutBranch(repoPath: string, branchName: string): Promise<void> {

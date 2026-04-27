@@ -15,6 +15,7 @@ import fs from 'fs';
 import path from 'path';
 import { DatabaseSync } from 'node:sqlite';
 import { DATA_DIR } from '../../config.js';
+import { buildImportGraph } from '../../shared/import-graph.js';
 
 /* ── Domain Types ── */
 
@@ -391,6 +392,39 @@ export class KnowledgeGraphStore {
     }));
   }
 
+  /* ── File Change Attribution ── */
+
+  getFileChangesWithAttribution(
+    projectName: string,
+    limit = 50,
+  ): Array<{
+    filePath: string;
+    runId: string;
+    taskId: string | null;
+    changeType: string;
+    gatePassed: boolean;
+    createdAt: string;
+  }> {
+    const rows = this.db
+      .prepare(
+        `SELECT file_path, run_id, task_id, change_type, gate_passed, created_at
+         FROM file_change_log
+         WHERE project_name = ?
+         ORDER BY created_at DESC
+         LIMIT ?`,
+      )
+      .all(projectName, limit) as Array<Record<string, unknown>>;
+
+    return rows.map((r) => ({
+      filePath: String(r.file_path),
+      runId: String(r.run_id),
+      taskId: r.task_id ? String(r.task_id) : null,
+      changeType: String(r.change_type),
+      gatePassed: Number(r.gate_passed) === 1,
+      createdAt: String(r.created_at),
+    }));
+  }
+
   /* ── Full Snapshot (for planner injection) ── */
 
   getProjectSnapshot(projectName: string): KnowledgeSnapshot {
@@ -490,6 +524,79 @@ export class KnowledgeGraphStore {
       }
       this.incrementModuleChanges(params.projectName, modulePath, file.gatePassed);
     }
+  }
+
+  /**
+   * Scan a project's source tree and populate the knowledge graph with module
+   * boundaries and dependency relationships. Call on first workspace prep
+   * when the graph has 0 modules for the project.
+   */
+  scanProjectStructure(projectName: string, repoPath: string): number {
+    const graph = buildImportGraph(repoPath, ['.']);
+    if (graph.size === 0) return 0;
+
+    // Derive modules from file paths (group by first 2 path segments)
+    const moduleFiles = new Map<string, string[]>();
+    for (const filePath of graph.keys()) {
+      const segments = filePath.split('/');
+      const modulePath = segments.length >= 2 ? segments.slice(0, 2).join('/') : segments[0];
+      if (!moduleFiles.has(modulePath)) moduleFiles.set(modulePath, []);
+      moduleFiles.get(modulePath)!.push(filePath);
+    }
+
+    // Build dependency relationships between modules
+    for (const [modulePath, files] of moduleFiles) {
+      const deps = new Set<string>();
+      const dependents = new Set<string>();
+
+      for (const file of files) {
+        const fileDeps = graph.get(file);
+        if (!fileDeps) continue;
+        for (const dep of fileDeps) {
+          const depSegments = dep.split('/');
+          const depModule = depSegments.length >= 2 ? depSegments.slice(0, 2).join('/') : depSegments[0];
+          if (depModule !== modulePath) deps.add(depModule);
+        }
+      }
+
+      // Collect dependents by scanning all files that import files in this module
+      for (const [otherFile, otherDeps] of graph) {
+        const otherSegments = otherFile.split('/');
+        const otherModule = otherSegments.length >= 2 ? otherSegments.slice(0, 2).join('/') : otherSegments[0];
+        if (otherModule === modulePath) continue;
+
+        for (const dep of otherDeps) {
+          if (files.includes(dep)) {
+            dependents.add(otherModule);
+            break;
+          }
+        }
+      }
+
+      // Collect exports (scan for export statements in module files)
+      const exports: string[] = [];
+      const exportPattern = /export\s+(?:default\s+)?(?:function|class|const|let|var|interface|type|enum)\s+(\w+)/g;
+      for (const file of files.slice(0, 10)) {
+        try {
+          const content = fs.readFileSync(path.join(repoPath, file), 'utf8');
+          let match;
+          while ((match = exportPattern.exec(content)) !== null) {
+            if (exports.length < 20) exports.push(match[1]);
+          }
+        } catch {
+          // Skip unreadable files
+        }
+      }
+
+      this.upsertModule(projectName, modulePath, {
+        moduleType: inferModuleType(modulePath),
+        dependencies: Array.from(deps),
+        dependents: Array.from(dependents),
+        exports: exports.slice(0, 20),
+      });
+    }
+
+    return moduleFiles.size;
   }
 
   close(): void {

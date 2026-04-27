@@ -17,6 +17,7 @@ export function getDefaultAutonomousRunPolicy(): AutonomousRunPolicy {
     maxCommits: 8,
     maxTokensPerRun: 2_000_000,
     maxTokensPerTask: 500_000,
+    maxMinutesPerTask: 30,
     gates: {
       runTypecheck: true,
       runLint: true,
@@ -42,6 +43,7 @@ export function normalizePolicy(policy: AutonomousRunPolicy): AutonomousRunPolic
     maxCommits: clamp(policy.maxCommits, 1, 50),
     maxTokensPerRun: policy.maxTokensPerRun ?? 2_000_000,
     maxTokensPerTask: policy.maxTokensPerTask ?? 500_000,
+    maxMinutesPerTask: clamp(policy.maxMinutesPerTask ?? 30, 5, 120),
   };
 }
 
@@ -61,6 +63,7 @@ const POLICY_PRESETS: Record<PolicyPreset, Partial<AutonomousRunPolicy>> = {
     maxCommits: 4,
     maxTokensPerRun: 1_000_000,
     maxTokensPerTask: 250_000,
+    maxMinutesPerTask: 20,
     autoApprovePlan: false,
   },
   balanced: {
@@ -71,6 +74,7 @@ const POLICY_PRESETS: Record<PolicyPreset, Partial<AutonomousRunPolicy>> = {
     maxCommits: 8,
     maxTokensPerRun: 2_000_000,
     maxTokensPerTask: 500_000,
+    maxMinutesPerTask: 30,
     autoApprovePlan: true,
   },
   aggressive: {
@@ -81,6 +85,7 @@ const POLICY_PRESETS: Record<PolicyPreset, Partial<AutonomousRunPolicy>> = {
     maxCommits: 25,
     maxTokensPerRun: 5_000_000,
     maxTokensPerTask: 1_000_000,
+    maxMinutesPerTask: 45,
     autoApprovePlan: true,
   },
 };

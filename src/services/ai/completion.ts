@@ -50,10 +50,14 @@ export async function roleCompletion(
 
   const response = await provider.complete(llmRequest);
 
-  // Track token usage (budget enforcement disabled for now — log only)
+  // Track token usage and enforce budgets
   if (request.runId) {
     const tracker = getTokenTracker();
     const budgetCheck = tracker.record(request.runId, request.taskId ?? null, response.usage.totalTokens);
+
+    if (budgetCheck.status === 'exceeded') {
+      throw new Error(`Token budget exceeded: ${budgetCheck.message || 'Run or task token limit reached.'}`);
+    }
 
     if (budgetCheck.status === 'warning' && budgetCheck.message) {
       console.warn(`⚠️ Token budget: ${budgetCheck.message}`);

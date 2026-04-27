@@ -190,4 +190,31 @@ export const telemetry = {
       metadata: { errorCount: payload.errorCount, errors: payload.errors.slice(0, 5) },
     });
   },
+
+  redirectSpiral(payload: {
+    runId: string;
+    taskId: string;
+    projectName: string;
+    consecutiveRedirects: number;
+    iterationCount: number;
+    toolsStripped: boolean;
+  }) {
+    getTelemetryStore().emit({
+      runId: payload.runId,
+      taskId: payload.taskId,
+      projectName: payload.projectName,
+      event: 'agent.redirect_spiral',
+      durationMs: null,
+      tokensInput: null,
+      tokensOutput: null,
+      tokensTotal: null,
+      model: null,
+      status: payload.toolsStripped ? 'failure' : 'warning',
+      metadata: {
+        consecutiveRedirects: payload.consecutiveRedirects,
+        iterationCount: payload.iterationCount,
+        toolsStripped: payload.toolsStripped,
+      },
+    });
+  },
 };

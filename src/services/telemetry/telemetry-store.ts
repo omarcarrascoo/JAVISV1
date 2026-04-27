@@ -258,6 +258,77 @@ export class TelemetryStore {
     };
   }
 
+  /**
+   * Gate pass/fail/skip rates aggregated by gate name.
+   */
+  getGateStats(projectName: string, days = 30): Array<{
+    gate: string;
+    passed: number;
+    failed: number;
+    skipped: number;
+    total: number;
+  }> {
+    const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+    const rows = this.db
+      .prepare(`
+        SELECT
+          REPLACE(event, 'gate.', '') as gate_name,
+          SUM(CASE WHEN status = 'success' THEN 1 ELSE 0 END) as passed,
+          SUM(CASE WHEN status = 'failure' THEN 1 ELSE 0 END) as failed,
+          SUM(CASE WHEN status = 'info' THEN 1 ELSE 0 END) as skipped,
+          COUNT(*) as total
+        FROM telemetry
+        WHERE project_name = ? AND event LIKE 'gate.%' AND created_at >= ?
+        GROUP BY gate_name
+        ORDER BY total DESC
+      `)
+      .all(projectName, cutoff) as Array<Record<string, unknown>>;
+
+    return rows.map((r) => ({
+      gate: String(r.gate_name),
+      passed: Number(r.passed) || 0,
+      failed: Number(r.failed) || 0,
+      skipped: Number(r.skipped) || 0,
+      total: Number(r.total) || 0,
+    }));
+  }
+
+  /**
+   * Edit success/failure/fuzzy-match metrics.
+   */
+  getEditMetrics(projectName: string, days = 30): {
+    applied: number;
+    failed: number;
+    fuzzyMatches: number;
+    total: number;
+    successRate: number;
+  } {
+    const cutoff = new Date(Date.now() - days * 86_400_000).toISOString();
+    const row = this.db
+      .prepare(`
+        SELECT
+          SUM(CASE WHEN event = 'edit.applied' THEN 1 ELSE 0 END) as applied,
+          SUM(CASE WHEN event = 'edit.failed' THEN 1 ELSE 0 END) as failed,
+          SUM(CASE WHEN event = 'edit.applied' AND metadata LIKE '%fuzzy%' THEN 1 ELSE 0 END) as fuzzy,
+          COUNT(*) as total
+        FROM telemetry
+        WHERE project_name = ? AND event LIKE 'edit.%' AND created_at >= ?
+      `)
+      .get(projectName, cutoff) as Record<string, unknown>;
+
+    const applied = Number(row.applied) || 0;
+    const failed = Number(row.failed) || 0;
+    const total = applied + failed;
+
+    return {
+      applied,
+      failed,
+      fuzzyMatches: Number(row.fuzzy) || 0,
+      total,
+      successRate: total > 0 ? applied / total : 0,
+    };
+  }
+
   close(): void {
     this.db.close();
   }

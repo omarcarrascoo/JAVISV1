@@ -13,6 +13,7 @@ import { getTelemetryStore } from '../../services/telemetry/telemetry-store.js';
 import { getLearningStore } from '../../services/learning/learning-store.js';
 import { getKnowledgeGraph } from '../../services/knowledge/index.js';
 import { handleGitHubWebhook } from '../webhooks/index.js';
+import { normalizePolicy, getProjectPolicy } from '../../services/orchestration/policy-engine.js';
 
 type RunPayload = NonNullable<ReturnType<typeof buildRunPayload>>;
 
@@ -789,10 +790,37 @@ const GLOBAL_CSS = `
     color: var(--text-main);
     font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     background: var(--bg-app);
-    display: flex;
+    display: flex; flex-direction: column;
   }
   a { text-decoration: none; color: inherit; }
   pre { margin: 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.5; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; color: var(--text-muted); }
+
+  /* ── Global Navigation ── */
+  .global-nav {
+    display: flex; align-items: center; gap: 2px;
+    padding: 0 24px; height: 48px; min-height: 48px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-sidenav); flex-shrink: 0; z-index: 20;
+  }
+  .global-nav .brand {
+    font-weight: 600; font-size: 14px; letter-spacing: 0.02em;
+    margin-right: 28px; display: flex; align-items: center; gap: 8px;
+    color: var(--text-main);
+  }
+  .global-nav .brand-dot {
+    width: 8px; height: 8px; background: #fafafa; border-radius: 2px;
+  }
+  .global-nav .gn-link {
+    padding: 6px 14px; border-radius: 6px;
+    font-size: 13px; font-weight: 500; color: var(--text-muted);
+    transition: all 0.15s; border: 1px solid transparent;
+  }
+  .global-nav .gn-link:hover { background: var(--bg-surface); color: var(--text-main); }
+  .global-nav .gn-link.active { background: var(--bg-surface); color: var(--text-main); border-color: var(--border); }
+  .global-nav .nav-spacer { flex: 1; }
+
+  /* ── Page layout beneath the nav ── */
+  .page-below-nav { flex: 1; display: flex; overflow: hidden; }
 
   .sidenav {
     width: 280px; min-width: 280px;
@@ -803,8 +831,7 @@ const GLOBAL_CSS = `
     z-index: 10;
   }
   .sidenav-header { padding: 8px 4px; display: flex; align-items: center; justify-content: space-between; }
-  .sidenav-header h2 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0.02em; display: flex; align-items: center; gap: 8px;}
-  .sidenav-header h2::before { content: ''; display: inline-block; width: 8px; height: 8px; background: #fafafa; border-radius: 2px; }
+  .sidenav-header h2 { margin: 0; font-size: 14px; font-weight: 600; letter-spacing: 0.02em; }
   .search-box {
     background: var(--bg-app); border: 1px solid var(--border);
     color: var(--text-main); padding: 10px 14px;
@@ -843,101 +870,181 @@ function buildHomePageShell(): string {
     <title>Unity · Home</title>
     <style>
       ${GLOBAL_CSS}
-      .home-container {
-        max-width: 900px; margin: 0 auto; width: 100%;
-        padding: 80px 48px; display: flex; flex-direction: column; gap: 48px;
+      .home-body { display:flex; flex:1; overflow:hidden; }
+      .home-sidebar {
+        width:280px; min-width:280px; background:var(--bg-sidenav);
+        border-right:1px solid var(--border); display:flex; flex-direction:column;
+        padding:16px; gap:12px;
       }
-      .greeting h1 { font-size: 32px; font-weight: 400; letter-spacing: -0.02em; margin: 0 0 12px 0; }
-      .greeting p { color: var(--text-muted); font-size: 15px; margin: 0; line-height: 1.6; max-width: 600px; }
-      .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 16px; }
+      .home-sidebar h3 { margin:0; font-size:13px; font-weight:600; color:var(--text-muted); text-transform:uppercase; letter-spacing:0.05em; padding:4px; }
+      .home-main { flex:1; overflow-y:auto; padding:32px 48px; }
+      .home-header { margin-bottom:32px; }
+      .home-header h1 { font-size:28px; font-weight:400; letter-spacing:-0.02em; margin:0 0 8px; }
+      .home-header p { color:var(--text-muted); font-size:14px; margin:0; max-width:600px; line-height:1.6; }
+      .stats-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px,1fr)); gap:12px; margin-bottom:32px; }
       .stat-card {
-        background: var(--bg-surface); border: 1px solid var(--border);
-        border-radius: var(--radius); padding: 24px;
-        display: flex; flex-direction: column; gap: 8px;
+        background:var(--bg-surface); border:1px solid var(--border);
+        border-radius:var(--radius); padding:20px;
+        display:flex; flex-direction:column; gap:6px;
       }
-      .stat-label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); font-weight: 600; }
-      .stat-value { font-size: 32px; font-weight: 300; }
+      .stat-label { font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted); font-weight:600; }
+      .stat-value { font-size:28px; font-weight:300; }
+      .stat-sub { font-size:12px; color:var(--text-muted); }
+      .section-title { font-size:16px; font-weight:500; margin:0 0 16px; }
+      .quick-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:12px; margin-bottom:32px; }
+      .quick-card {
+        background:var(--bg-surface); border:1px solid var(--border);
+        border-radius:var(--radius); padding:20px; cursor:pointer;
+        transition:all 0.15s; display:flex; flex-direction:column; gap:6px;
+      }
+      .quick-card:hover { border-color:#52525b; transform:translateY(-1px); box-shadow:0 8px 24px rgba(0,0,0,0.2); }
+      .quick-card .qc-title { font-size:14px; font-weight:500; }
+      .quick-card .qc-desc { font-size:12px; color:var(--text-muted); }
+      .runs-table { width:100%; border-collapse:collapse; font-size:13px; }
+      .runs-table th { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); color:var(--text-muted); font-size:11px; text-transform:uppercase; letter-spacing:0.05em; font-weight:600; }
+      .runs-table td { padding:10px 12px; border-bottom:1px solid #1e1e21; }
+      .runs-table tr { cursor:pointer; transition:background 0.1s; }
+      .runs-table tbody tr:hover { background:var(--bg-surface); }
+      .bar-track { height:6px; background:var(--bg-app); border-radius:99px; overflow:hidden; display:inline-block; width:80px; vertical-align:middle; }
+      .bar-fill { height:100%; border-radius:99px; }
+      .status-badge { display:inline-flex; align-items:center; padding:3px 8px; border-radius:99px; font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:0.04em; }
+      .health-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(200px,1fr)); gap:12px; margin-bottom:32px; }
+      .health-card {
+        background:var(--bg-surface); border:1px solid var(--border);
+        border-radius:var(--radius); padding:16px;
+        display:flex; flex-direction:column; gap:8px;
+      }
+      .health-label { font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted); font-weight:600; }
+      .health-row { display:flex; justify-content:space-between; align-items:center; }
+      .health-value { font-size:20px; font-weight:400; }
+      .health-bar { height:4px; background:var(--bg-app); border-radius:99px; overflow:hidden; }
+      .health-bar-fill { height:100%; border-radius:99px; transition:width 0.5s; }
     </style>
   </head>
   <body>
-    <aside class="sidenav">
-      <div class="sidenav-header">
-        <h2>Unity Deck</h2>
-      </div>
-      <input id="runs-search" class="search-box" type="text" placeholder="Search runs..." />
-      <div id="runs" class="runs-list"></div>
-    </aside>
+    ${buildGlobalNavHtml('/')}
 
-    <main class="main-content">
-      <div class="home-container">
-        <div class="greeting">
-          <h1>Good morning.</h1>
-          <p>Here is the current state of your autonomous agents. Select a run from the sidebar to inspect its execution graph, approve plans, or review artifacts.</p>
+    <div class="home-body">
+      <aside class="home-sidebar">
+        <h3>Recent Runs</h3>
+        <input id="runs-search" class="search-box" type="text" placeholder="Search runs..." />
+        <div id="runs" class="runs-list"></div>
+      </aside>
+
+      <main class="home-main">
+        <div class="home-header">
+          <h1>Dashboard</h1>
+          <p>Autonomous orchestrator overview. Monitor runs, review system health, and navigate to detailed views.</p>
         </div>
+
         <div class="stats-grid" id="hero-metrics"></div>
-      </div>
-    </main>
+
+        <h2 class="section-title">System Health</h2>
+        <div class="health-grid" id="health-grid"></div>
+
+        <h2 class="section-title">Quick Links</h2>
+        <div class="quick-grid">
+          <a href="/analytics" class="quick-card"><div class="qc-title">Analytics</div><div class="qc-desc">Cost trends, gate health, edit reliability, and model usage breakdown.</div></a>
+          <a href="/knowledge" class="quick-card"><div class="qc-title">Knowledge Graph</div><div class="qc-desc">Module boundaries, API endpoints, fragile areas, and architecture decisions.</div></a>
+          <a href="/learning" class="quick-card"><div class="qc-title">Learning Patterns</div><div class="qc-desc">Extracted patterns with effectiveness scores and application history.</div></a>
+          <a href="/settings" class="quick-card"><div class="qc-title">Settings</div><div class="qc-desc">Policy configuration, gate toggles, token budgets, and run parameters.</div></a>
+        </div>
+
+        <h2 class="section-title">All Runs</h2>
+        <table class="runs-table" id="runs-table">
+          <thead>
+            <tr><th>Project</th><th>Status</th><th>Tasks</th><th>Progress</th><th>Mode</th><th>Created</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </main>
+    </div>
 
     <script>
       let allRuns = [];
-      const statusColors = { completed: '#4ade80', completed_with_warnings: '#f59e0b', succeeded: '#4ade80', awaiting_plan_approval: '#facc15', pending: '#facc15', failed: '#f87171', blocked: '#f87171', plan_rejected: '#f87171', running: '#60a5fa', healing: '#60a5fa', cancelled: '#9ca3af' };
-      
-      function safe(value) { return String(value || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+      const statusColors = { completed:'#4ade80', completed_with_warnings:'#f59e0b', succeeded:'#4ade80', awaiting_plan_approval:'#facc15', pending:'#facc15', failed:'#f87171', blocked:'#f87171', plan_rejected:'#f87171', running:'#60a5fa', healing:'#60a5fa', cancelled:'#9ca3af' };
+      function safe(v){return String(v||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+      function badge(s){var c=statusColors[s]||'#d1d5db';return '<span class="status-badge" style="background:'+c+'15;color:'+c+';border:1px solid '+c+'30;">'+safe(s.replaceAll('_',' '))+'</span>';}
+      function bar(pct,color){return '<div class="bar-track"><div class="bar-fill" style="width:'+pct+'%;background:'+(color||'#4ade80')+'"></div></div>';}
+      function ago(d){if(!d)return'—';var ms=Date.now()-new Date(d).getTime(),m=Math.round(ms/60000);if(m<1)return'just now';if(m<60)return m+'m ago';var h=Math.round(m/60);if(h<24)return h+'h ago';return Math.round(h/24)+'d ago';}
 
-      function renderMetrics(items) {
-        const awaiting = items.filter(({ run }) => run.status === 'awaiting_plan_approval').length;
-        const active = items.filter(({ run }) => run.status === 'running' || run.status === 'healing').length;
-        const completed = items.filter(({ run }) => run.status === 'completed').length;
-        const needsReview = items.filter(({ run }) => run.status === 'completed_with_warnings').length;
-        const failed = items.filter(({ run }) => run.status === 'failed').length;
-
-        document.getElementById('hero-metrics').innerHTML = [
-          ['Awaiting Approval', awaiting],
-          ['Active Runs', active],
-          ['Completed', completed],
-          ['Needs Review', needsReview],
-          ['Failed', failed],
-        ].map(m => \`<div class="stat-card"><div class="stat-label">\${m[0]}</div><div class="stat-value">\${m[1]}</div></div>\`).join('');
-      }
-
-      function filterRuns(items) {
-        const search = (document.getElementById('runs-search').value || '').toLowerCase().trim();
-        return items.filter(item => {
-          const haystack = [item.run.projectName, item.run.id, item.run.prompt].join(' ').toLowerCase();
-          return !search || haystack.includes(search);
+      function renderMetrics(items){
+        var aw=0,ac=0,co=0,nr=0,fa=0;
+        items.forEach(function(i){
+          var s=i.run.status;
+          if(s==='awaiting_plan_approval')aw++;
+          else if(s==='running'||s==='healing')ac++;
+          else if(s==='completed')co++;
+          else if(s==='completed_with_warnings')nr++;
+          else if(s==='failed')fa++;
         });
+        document.getElementById('hero-metrics').innerHTML=[
+          ['Active Runs',ac,'#60a5fa'],['Awaiting Approval',aw,'#facc15'],['Completed',co,'#4ade80'],['Needs Review',nr,'#f59e0b'],['Failed',fa,'#f87171'],['Total Runs',items.length,'#e4e4e7']
+        ].map(function(m){return '<div class="stat-card"><div class="stat-label">'+m[0]+'</div><div class="stat-value" style="color:'+m[2]+'">'+m[1]+'</div></div>';}).join('');
       }
 
-      function renderRunsList(items) {
-        const container = document.getElementById('runs');
-        if (!items.length) {
-          container.innerHTML = '<div class="muted" style="font-size:12px; padding:12px; text-align:center;">No runs found.</div>';
-          return;
-        }
-
-        container.innerHTML = items.map(item => {
-          const color = statusColors[item.run.status] || '#d1d5db';
-          const formatStat = item.run.status.replaceAll('_', ' ');
-          return \`<a class="run-nav-item" href="/runs/\${encodeURIComponent(item.run.id)}">
-            <div class="run-nav-title">\${safe(item.run.projectName)}</div>
-            <div class="run-nav-meta">
-              <div class="run-nav-status"><div class="status-dot" style="background:\${color}"></div><span>\${safe(formatStat)}</span></div>
-              <span>\${item.taskCounts?.progress || 0}%</span>
-            </div>
-          </a>\`;
+      function renderRunsTable(items){
+        var tbody=document.querySelector('#runs-table tbody');
+        if(!items.length){tbody.innerHTML='<tr><td colspan="6" class="muted" style="text-align:center;padding:24px;">No runs yet.</td></tr>';return;}
+        tbody.innerHTML=items.map(function(item){
+          var r=item.run,tc=item.taskCounts||{};
+          return '<tr onclick="location.href=\\'/runs/'+encodeURIComponent(r.id)+'\\'">'
+            +'<td style="font-weight:500">'+safe(r.projectName)+'</td>'
+            +'<td>'+badge(r.status)+'</td>'
+            +'<td>'+safe((tc.succeeded||0)+'/'+(tc.total||0))+'</td>'
+            +'<td>'+bar(tc.progress||0)+'<span style="font-size:11px;margin-left:6px;color:var(--text-muted)">'+(tc.progress||0)+'%</span></td>'
+            +'<td style="color:var(--text-muted)">'+safe(r.mode)+'</td>'
+            +'<td style="color:var(--text-muted);font-size:12px">'+ago(r.createdAt)+'</td>'
+            +'</tr>';
         }).join('');
       }
 
-      async function loadRuns() {
-        const response = await fetch('/api/runs');
-        allRuns = await response.json();
-        renderMetrics(allRuns);
-        renderRunsList(filterRuns(allRuns));
+      async function renderHealth(){
+        var [gR,eR,lR]=await Promise.all([
+          fetch('/api/telemetry/gate-stats'),fetch('/api/telemetry/edit-metrics'),fetch('/api/learning/stats')
+        ]);
+        var gates=await gR.json(),edits=await eR.json(),learning=await lR.json();
+        var gateTotal=0,gatePassed=0;
+        gates.forEach(function(g){gateTotal+=g.total;gatePassed+=g.passed;});
+        var gateRate=gateTotal>0?Math.round(gatePassed/gateTotal*100):0;
+        var editRate=edits.total>0?Math.round(edits.applied/edits.total*100):0;
+        var learnRate=learning.overallSuccessRate?Math.round(learning.overallSuccessRate*100):0;
+        document.getElementById('health-grid').innerHTML=[
+          ['Gate Pass Rate',gateRate+'%',gateRate,gateRate>70?'#4ade80':'#f59e0b'],
+          ['Edit Success',editRate+'%',editRate,editRate>80?'#4ade80':'#f59e0b'],
+          ['Learning Patterns',learning.totalPatterns||0,Math.min(100,(learning.totalPatterns||0)*10),'#60a5fa'],
+          ['Pattern Success',learnRate+'%',learnRate,learnRate>50?'#4ade80':'#f59e0b']
+        ].map(function(h){return '<div class="health-card"><div class="health-label">'+h[0]+'</div><div class="health-row"><div class="health-value">'+h[1]+'</div></div><div class="health-bar"><div class="health-bar-fill" style="width:'+h[2]+'%;background:'+h[3]+'"></div></div></div>';}).join('');
       }
 
-      document.getElementById('runs-search').addEventListener('input', () => renderRunsList(filterRuns(allRuns)));
+      function filterRuns(items){
+        var s=(document.getElementById('runs-search').value||'').toLowerCase().trim();
+        return items.filter(function(i){return!s||[i.run.projectName,i.run.id,i.run.prompt].join(' ').toLowerCase().includes(s);});
+      }
+
+      function renderSidebar(items){
+        var container=document.getElementById('runs');
+        if(!items.length){container.innerHTML='<div class="muted" style="font-size:12px;padding:12px;text-align:center;">No runs found.</div>';return;}
+        container.innerHTML=items.map(function(item){
+          var c=statusColors[item.run.status]||'#d1d5db';
+          return '<a class="run-nav-item" href="/runs/'+encodeURIComponent(item.run.id)+'">'
+            +'<div class="run-nav-title">'+safe(item.run.projectName)+'</div>'
+            +'<div class="run-nav-meta"><div class="run-nav-status"><div class="status-dot" style="background:'+c+'"></div><span>'+safe(item.run.status.replaceAll('_',' '))+'</span></div><span>'+(item.taskCounts?.progress||0)+'%</span></div>'
+            +'</a>';
+        }).join('');
+      }
+
+      async function loadRuns(){
+        var r=await fetch('/api/runs');allRuns=await r.json();
+        renderMetrics(allRuns);
+        renderSidebar(filterRuns(allRuns));
+        renderRunsTable(filterRuns(allRuns));
+      }
+
+      document.getElementById('runs-search').addEventListener('input',function(){renderSidebar(filterRuns(allRuns));renderRunsTable(filterRuns(allRuns));});
       loadRuns();
-      setInterval(loadRuns, 5000);
+      renderHealth();
+      setInterval(loadRuns,5000);
     </script>
   </body>
 </html>`;
@@ -1095,9 +1202,11 @@ function renderRunPage(
     </style>
   </head>
   <body>
+    ${buildGlobalNavHtml('/runs')}
+    <div class="page-below-nav">
     <aside class="sidenav">
       <div class="sidenav-header">
-        <a href="/">Unity Deck</a>
+        <h2>Runs</h2>
       </div>
       <input id="runs-search" class="search-box" type="text" placeholder="Search runs..." />
       <div id="runs" class="runs-list"></div>
@@ -1186,6 +1295,7 @@ function renderRunPage(
         </aside>
       </div>
     </main>
+    </div>
 
     <div class="diff-modal-overlay" id="diff-overlay">
       <div class="diff-modal">
@@ -1522,6 +1632,486 @@ function renderRunPage(
 </html>`;
 }
 
+/* ── Analytics Dashboard Page ── */
+
+function buildGlobalNavHtml(active: string): string {
+  const items = [
+    { href: '/', label: 'Home', id: '/' },
+    { href: '/analytics', label: 'Analytics', id: '/analytics' },
+    { href: '/knowledge', label: 'Knowledge', id: '/knowledge' },
+    { href: '/learning', label: 'Learning', id: '/learning' },
+    { href: '/settings', label: 'Settings', id: '/settings' },
+  ];
+  return `<nav class="global-nav">
+    <a href="/" class="brand"><span class="brand-dot"></span>Unity</a>
+    ${items.map((i) => `<a href="${i.href}" class="gn-link${active === i.id ? ' active' : ''}">${i.label}</a>`).join('')}
+    <span class="nav-spacer"></span>
+  </nav>`;
+}
+
+function shellPage(title: string, activePath: string, bodyHtml: string, scriptHtml: string): string {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/><title>Unity · ${escapeHtml(title)}</title>
+<style>
+${GLOBAL_CSS}
+.page-body { flex:1; overflow-y:auto; padding:32px 48px; }
+.page-title { font-size:24px; font-weight:500; margin:0 0 8px; }
+.page-subtitle { color:var(--text-muted); font-size:14px; margin:0 0 32px; }
+.card-grid { display:grid; grid-template-columns:repeat(auto-fit, minmax(220px,1fr)); gap:16px; margin-bottom:32px; }
+.card { background:var(--bg-surface); border:1px solid var(--border); border-radius:var(--radius); padding:20px; }
+.card-label { font-size:11px; text-transform:uppercase; letter-spacing:0.05em; color:var(--text-muted); font-weight:600; margin-bottom:8px; }
+.card-value { font-size:28px; font-weight:300; }
+.card-sub { font-size:12px; color:var(--text-muted); margin-top:4px; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; padding:10px 12px; border-bottom:1px solid var(--border); color:var(--text-muted); font-size:11px; text-transform:uppercase; letter-spacing:0.05em; font-weight:600; }
+td { padding:10px 12px; border-bottom:1px solid #1e1e21; }
+.bar-track { height:8px; background:var(--bg-app); border-radius:99px; overflow:hidden; }
+.bar-fill { height:100%; border-radius:99px; transition:width 0.3s; }
+.section-title { font-size:16px; font-weight:500; margin:0 0 16px; }
+.section-gap { margin-top:32px; }
+.two-col { display:grid; grid-template-columns:1fr 1fr; gap:24px; }
+@media(max-width:1000px){ .two-col { grid-template-columns:1fr; } }
+</style></head><body>
+${buildGlobalNavHtml(activePath)}
+<main class="page-body">${bodyHtml}</main>
+<script>${scriptHtml}</script>
+</body></html>`;
+}
+
+function buildAnalyticsPage(): string {
+  return shellPage('Analytics', '/analytics', `
+    <h1 class="page-title">Analytics Dashboard</h1>
+    <p class="page-subtitle">Cost, gate health, edit reliability, and learning effectiveness across all runs.</p>
+
+    <div class="card-grid" id="cost-cards"></div>
+
+    <div class="two-col section-gap">
+      <div>
+        <h2 class="section-title">Gate Health</h2>
+        <table id="gate-table"><thead><tr><th>Gate</th><th>Passed</th><th>Failed</th><th>Skipped</th><th>Pass Rate</th></tr></thead><tbody></tbody></table>
+      </div>
+      <div>
+        <h2 class="section-title">Edit Reliability</h2>
+        <div class="card-grid" style="grid-template-columns:1fr 1fr;" id="edit-cards"></div>
+      </div>
+    </div>
+
+    <div class="two-col section-gap">
+      <div>
+        <h2 class="section-title">Learning Effectiveness</h2>
+        <div class="card-grid" style="grid-template-columns:1fr 1fr;" id="learning-cards"></div>
+      </div>
+      <div>
+        <h2 class="section-title">Model Cost Breakdown</h2>
+        <table id="model-table"><thead><tr><th>Model</th><th>Tokens</th><th>Est. Cost</th><th>Share</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+
+    <h2 class="section-title section-gap">Recent Run Costs</h2>
+    <table id="run-cost-table"><thead><tr><th>Run</th><th>Project</th><th>Status</th><th>Tasks</th><th>Tokens</th><th>Est. Cost</th><th>When</th></tr></thead><tbody></tbody></table>
+
+    <h2 class="section-title section-gap">Hot Files</h2>
+    <table id="hot-table"><thead><tr><th>File</th><th>Changes</th><th>Failures</th><th>Fragility</th></tr></thead><tbody></tbody></table>
+  `, `
+    function safe(v){return String(v||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+    function pct(n,d){return d>0?(n/d*100).toFixed(1)+'%':'—';}
+    function bar(ratio,color){return '<div class="bar-track" style="width:100px;display:inline-block;vertical-align:middle;"><div class="bar-fill" style="width:'+Math.round(Math.min(ratio,1)*100)+'%;background:'+color+'"></div></div>';}
+    var statusColors={completed:'#4ade80',completed_with_warnings:'#f59e0b',failed:'#f87171',running:'#60a5fa',awaiting_plan_approval:'#facc15',cancelled:'#9ca3af'};
+    function badge(s){var c=statusColors[s]||'#d1d5db';return '<span style="display:inline-flex;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;background:'+c+'15;color:'+c+';border:1px solid '+c+'30;">'+safe(s.replaceAll('_',' '))+'</span>';}
+    function ago(d){if(!d)return'—';var ms=Date.now()-new Date(d).getTime(),m=Math.round(ms/60000);if(m<60)return m+'m ago';var h=Math.round(m/60);if(h<24)return h+'h ago';return Math.round(h/24)+'d ago';}
+
+    async function load(){
+      const [statsR,gatesR,editsR,learningR,hotR,runsR]=await Promise.all([
+        fetch('/api/telemetry/stats'),fetch('/api/telemetry/gate-stats'),
+        fetch('/api/telemetry/edit-metrics'),fetch('/api/learning/stats'),
+        fetch('/api/knowledge/hot-files'),fetch('/api/runs')
+      ]);
+      const stats=await statsR.json(),gates=await gatesR.json(),edits=await editsR.json(),learning=await learningR.json(),hot=await hotR.json(),runs=await runsR.json();
+
+      document.getElementById('cost-cards').innerHTML=[
+        ['Total Runs',stats.totalRuns,'#e4e4e7'],['Total Tokens',(stats.totalTokens||0).toLocaleString(),'#60a5fa'],
+        ['Total Cost','$'+(stats.totalCostUsd||0).toFixed(2),'#f59e0b'],['Avg Tokens/Run',(stats.avgTokensPerRun||0).toLocaleString(),'#a78bfa'],
+        ['Success Rate',pct(Math.round((stats.successRate||0)*stats.totalRuns),stats.totalRuns||1),'#4ade80']
+      ].map(function(c){return '<div class="card"><div class="card-label">'+c[0]+'</div><div class="card-value" style="color:'+c[2]+'">'+c[1]+'</div></div>';}).join('');
+
+      var gtb=document.querySelector('#gate-table tbody');
+      gtb.innerHTML=gates.length?gates.map(function(g){var rate=g.total>0?g.passed/g.total:0;return '<tr><td style="font-weight:500">'+safe(g.gate)+'</td><td>'+g.passed+'</td><td style="color:#f87171">'+g.failed+'</td><td style="color:var(--text-muted)">'+g.skipped+'</td><td>'+bar(rate,'#4ade80')+' <span style="font-size:12px;color:var(--text-muted);margin-left:4px">'+pct(g.passed,g.total)+'</span></td></tr>';}).join(''):'<tr><td colspan="5" class="muted">No gate data yet.</td></tr>';
+
+      document.getElementById('edit-cards').innerHTML=[
+        ['Applied',edits.applied],['Failed',edits.failed],
+        ['Fuzzy Saves',edits.fuzzyMatches],['Success Rate',pct(edits.applied,edits.total)]
+      ].map(function(c){return '<div class="card"><div class="card-label">'+c[0]+'</div><div class="card-value">'+c[1]+'</div></div>';}).join('');
+
+      document.getElementById('learning-cards').innerHTML=[
+        ['Patterns',learning.totalPatterns],['Effective',learning.effectivePatterns],
+        ['Applications',learning.totalApplications],['Success Rate',(learning.overallSuccessRate*100).toFixed(1)+'%']
+      ].map(function(c){return '<div class="card"><div class="card-label">'+c[0]+'</div><div class="card-value">'+c[1]+'</div></div>';}).join('');
+
+      // Model cost breakdown — aggregate from per-run telemetry
+      var modelMap={};
+      var costPromises=runs.slice(0,20).map(function(item){
+        return fetch('/api/runs/'+encodeURIComponent(item.run.id)+'/cost').then(function(r){return r.json();});
+      });
+      var costData=await Promise.all(costPromises);
+      costData.forEach(function(cd){
+        if(!cd.summary||!cd.summary.modelBreakdown)return;
+        cd.summary.modelBreakdown.forEach(function(mb){
+          if(!modelMap[mb.model])modelMap[mb.model]={tokens:0,cost:0};
+          modelMap[mb.model].tokens+=mb.tokens;
+          modelMap[mb.model].cost+=mb.costUsd;
+        });
+      });
+      var models=Object.entries(modelMap).sort(function(a,b){return b[1].tokens-a[1].tokens;});
+      var totalModelTokens=models.reduce(function(s,m){return s+m[1].tokens;},0)||1;
+      var mtb=document.querySelector('#model-table tbody');
+      mtb.innerHTML=models.length?models.map(function(m){var share=m[1].tokens/totalModelTokens;return '<tr><td style="font-family:monospace;font-size:12px;font-weight:500">'+safe(m[0])+'</td><td>'+m[1].tokens.toLocaleString()+'</td><td>$'+m[1].cost.toFixed(2)+'</td><td>'+bar(share,'#a78bfa')+' <span style="font-size:12px;color:var(--text-muted);margin-left:4px">'+(share*100).toFixed(0)+'%</span></td></tr>';}).join(''):'<tr><td colspan="4" class="muted">No model data yet.</td></tr>';
+
+      // Per-run cost table
+      var rctb=document.querySelector('#run-cost-table tbody');
+      rctb.innerHTML=runs.slice(0,30).map(function(item,i){
+        var r=item.run,cd=costData[i]||{},cs=cd.summary||{};
+        return '<tr style="cursor:pointer" onclick="location.href=\\'/runs/'+encodeURIComponent(r.id)+'\\'">'
+          +'<td style="font-family:monospace;font-size:12px">'+safe(r.id.slice(0,12))+'</td>'
+          +'<td style="font-weight:500">'+safe(r.projectName)+'</td>'
+          +'<td>'+badge(r.status)+'</td>'
+          +'<td>'+(cs.taskCount||item.taskCounts?.total||0)+'</td>'
+          +'<td>'+(cs.totalTokens||0).toLocaleString()+'</td>'
+          +'<td style="color:#f59e0b">$'+(cs.totalCostUsd||0).toFixed(2)+'</td>'
+          +'<td style="color:var(--text-muted);font-size:12px">'+ago(r.createdAt)+'</td>'
+          +'</tr>';
+      }).join('');
+
+      var htb=document.querySelector('#hot-table tbody');
+      htb.innerHTML=hot.length?hot.map(function(f){var frag=f.changeCount>0?f.failureCount/f.changeCount:0;return '<tr><td style="font-family:monospace;font-size:12px">'+safe(f.path)+'</td><td>'+f.changeCount+'</td><td style="color:#f87171">'+f.failureCount+'</td><td>'+bar(frag,'#f59e0b')+' <span style="font-size:12px;color:var(--text-muted);margin-left:4px">'+(frag*100).toFixed(0)+'%</span></td></tr>';}).join(''):'<tr><td colspan="4" class="muted">No file change data yet.</td></tr>';
+    }
+    load();
+  `);
+}
+
+function buildKnowledgePage(): string {
+  return shellPage('Knowledge', '/knowledge', `
+    <h1 class="page-title">Knowledge Graph</h1>
+    <p class="page-subtitle">Module boundaries, API surface, architecture decisions, and file change attribution.</p>
+
+    <div class="card-grid" id="kg-summary"></div>
+
+    <h2 class="section-title section-gap">Modules</h2>
+    <table id="mod-table"><thead><tr><th>Module</th><th>Type</th><th>Dependencies</th><th>Dependents</th><th>Changes</th><th>Failures</th><th>Fragility</th></tr></thead><tbody></tbody></table>
+
+    <div class="two-col section-gap">
+      <div>
+        <h2 class="section-title">Fragile Areas</h2>
+        <div id="fragile-list"></div>
+      </div>
+      <div>
+        <h2 class="section-title">API Endpoints</h2>
+        <table id="api-table"><thead><tr><th>Method</th><th>Path</th><th>Source File</th></tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+
+    <h2 class="section-title section-gap">Architecture Decisions</h2>
+    <div id="decisions"></div>
+
+    <h2 class="section-title section-gap">Recent File Changes</h2>
+    <table id="changes-table"><thead><tr><th>File</th><th>Run</th><th>Task</th><th>Type</th><th>Gate</th><th>Date</th></tr></thead><tbody></tbody></table>
+  `, `
+    function safe(v){return String(v||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+    function bar(ratio,color){return '<div style="height:8px;background:var(--bg-app);border-radius:99px;overflow:hidden;width:80px;display:inline-block;vertical-align:middle;"><div style="height:100%;border-radius:99px;width:'+Math.round(Math.min(ratio,1)*100)+'%;background:'+color+'"></div></div>';}
+    function methodColor(m){return{GET:'#4ade80',POST:'#60a5fa',PUT:'#f59e0b',DELETE:'#f87171',PATCH:'#a78bfa'}[m]||'var(--text-muted)';}
+
+    async function load(){
+      const [modsR,fragileR,decisionsR,changesR,apiR]=await Promise.all([
+        fetch('/api/knowledge/modules'),fetch('/api/knowledge/fragile'),
+        fetch('/api/knowledge/decisions'),fetch('/api/knowledge/file-changes'),
+        fetch('/api/knowledge/api-endpoints')
+      ]);
+      const mods=await modsR.json(),fragile=await fragileR.json(),decisions=await decisionsR.json(),changes=await changesR.json(),apis=await apiR.json();
+
+      // Summary cards
+      document.getElementById('kg-summary').innerHTML=[
+        ['Modules',mods.length,'#60a5fa'],['API Endpoints',apis.length,'#4ade80'],
+        ['Decisions',decisions.length,'#a78bfa'],['File Changes',changes.length,'#f59e0b'],
+        ['Fragile Areas',fragile.length,'#f87171']
+      ].map(function(c){return '<div class="card"><div class="card-label">'+c[0]+'</div><div class="card-value" style="color:'+c[2]+'">'+c[1]+'</div></div>';}).join('');
+
+      // Modules table
+      document.querySelector('#mod-table tbody').innerHTML=mods.length?mods.map(function(m){
+        var deps=(m.dependencies||[]).length,depts=(m.dependents||[]).length;
+        var frag=m.changeFrequency>0?m.failureFrequency/m.changeFrequency:0;
+        var fragColor=frag>0.5?'#f87171':frag>0.2?'#f59e0b':'#4ade80';
+        return '<tr><td style="font-family:monospace;font-size:12px;font-weight:500">'+safe(m.modulePath)+'</td><td>'+safe(m.moduleType)+'</td><td>'+deps+'</td><td>'+depts+'</td><td>'+m.changeFrequency+'</td><td style="color:#f87171">'+(m.failureFrequency||0)+'</td><td>'+bar(frag,fragColor)+' <span style="font-size:12px;color:var(--text-muted);margin-left:4px">'+(frag*100).toFixed(0)+'%</span></td></tr>';
+      }).join(''):'<tr><td colspan="7" class="muted">No modules tracked yet. Run a project scan first.</td></tr>';
+
+      // Fragile areas
+      document.getElementById('fragile-list').innerHTML=fragile.length?fragile.map(function(f){
+        var score=Math.min(f.fragilityScore||0,1);
+        var color=score>0.5?'#f87171':score>0.2?'#f59e0b':'#4ade80';
+        return '<div class="card" style="margin-bottom:8px;display:flex;align-items:center;gap:16px;padding:14px 16px;"><div style="flex:1;font-family:monospace;font-size:12px;font-weight:500">'+safe(f.modulePath)+'</div><div>'+bar(score,color)+'</div><div style="font-size:13px;font-weight:500;min-width:40px;text-align:right;color:'+color+'">'+(score*100).toFixed(0)+'%</div></div>';
+      }).join(''):'<div class="muted" style="padding:16px;">No fragile areas detected.</div>';
+
+      // API endpoints
+      document.querySelector('#api-table tbody').innerHTML=apis.length?apis.map(function(a){
+        return '<tr><td style="font-weight:600;color:'+methodColor(a.method)+'">'+safe(a.method)+'</td><td style="font-family:monospace;font-size:12px">'+safe(a.path)+'</td><td style="font-family:monospace;font-size:12px;color:var(--text-muted)">'+safe(a.sourceFile)+'</td></tr>';
+      }).join(''):'<tr><td colspan="3" class="muted">No API endpoints tracked yet.</td></tr>';
+
+      // Architecture decisions
+      document.getElementById('decisions').innerHTML=decisions.length?decisions.map(function(d){
+        var paths=(d.affectedPaths||[]).map(function(p){return '<span style="font-family:monospace;font-size:11px;padding:2px 6px;background:var(--bg-app);border:1px solid var(--border);border-radius:4px;">'+safe(p)+'</span>';}).join(' ');
+        return '<div class="card" style="margin-bottom:12px"><div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:8px"><div style="font-weight:500">'+safe(d.title)+'</div><span style="font-size:12px;color:var(--text-muted)">'+safe(d.createdAt?.slice(0,10))+'</span></div><pre style="margin-bottom:8px">'+safe(d.description)+'</pre>'+(d.context?'<pre style="color:var(--text-muted);font-size:11px;margin-bottom:8px">Context: '+safe(d.context)+'</pre>':'')+(paths?'<div style="display:flex;gap:4px;flex-wrap:wrap;">'+paths+'</div>':'')+'</div>';
+      }).join(''):'<div class="muted" style="padding:16px;">No architecture decisions recorded.</div>';
+
+      // File changes
+      document.querySelector('#changes-table tbody').innerHTML=changes.length?changes.map(function(c){
+        var gc=c.gatePassed?'#4ade80':'#f87171';
+        return '<tr><td style="font-family:monospace;font-size:12px">'+safe(c.filePath)+'</td><td style="font-family:monospace;font-size:11px">'+safe(c.runId?.slice(0,10)||'—')+'</td><td style="font-size:12px">'+safe(c.taskId?.slice(0,10)||'—')+'</td><td>'+safe(c.changeType)+'</td><td style="color:'+gc+';font-weight:500">'+(c.gatePassed?'passed':'failed')+'</td><td style="font-size:12px;color:var(--text-muted)">'+safe(c.createdAt?.slice(0,10))+'</td></tr>';
+      }).join(''):'<tr><td colspan="6" class="muted">No file changes recorded yet.</td></tr>';
+    }
+    load();
+  `);
+}
+
+function buildSettingsPage(): string {
+  return shellPage('Settings', '/settings', `
+    <h1 class="page-title">Policy Settings</h1>
+    <p class="page-subtitle">Configure autonomous run parameters, gate toggles, and token budgets.</p>
+
+    <div style="display:flex;gap:8px;margin-bottom:24px;">
+      <button class="preset-btn" data-preset="conservative" style="padding:8px 16px;border:1px solid var(--border);border-radius:8px;background:var(--bg-app);color:var(--text-main);cursor:pointer;font-size:13px;font-weight:500;">Conservative</button>
+      <button class="preset-btn" data-preset="balanced" style="padding:8px 16px;border:1px solid var(--border);border-radius:8px;background:var(--bg-app);color:var(--text-main);cursor:pointer;font-size:13px;font-weight:500;">Balanced</button>
+      <button class="preset-btn" data-preset="aggressive" style="padding:8px 16px;border:1px solid var(--border);border-radius:8px;background:var(--bg-app);color:var(--text-main);cursor:pointer;font-size:13px;font-weight:500;">Aggressive</button>
+    </div>
+
+    <div class="two-col" style="max-width:1000px;">
+      <div>
+        <div class="card">
+          <div style="font-weight:600;margin-bottom:16px;font-size:14px;">Run Parameters</div>
+          <div id="run-params"></div>
+        </div>
+        <div class="card" style="margin-top:16px;">
+          <div style="font-weight:600;margin-bottom:16px;font-size:14px;">Token Budgets</div>
+          <div id="token-params"></div>
+        </div>
+      </div>
+      <div>
+        <div class="card">
+          <div style="font-weight:600;margin-bottom:16px;font-size:14px;">Gate Toggles</div>
+          <div id="gate-toggles"></div>
+        </div>
+        <div class="card" style="margin-top:16px;">
+          <div style="font-weight:600;margin-bottom:16px;font-size:14px;">Branch Configuration</div>
+          <div id="branch-config"></div>
+        </div>
+      </div>
+    </div>
+
+    <div style="margin-top:24px;">
+      <button id="save-btn" style="padding:10px 28px;border:none;border-radius:8px;background:var(--text-main);color:var(--bg-app);font-weight:600;cursor:pointer;font-size:13px;">Save Policy</button>
+      <span id="save-status" style="margin-left:12px;font-size:13px;color:var(--text-muted);"></span>
+    </div>
+  `, `
+    var currentPolicy={};
+    var project=new URLSearchParams(location.search).get('project')||'';
+
+    function numField(label,key,hint){
+      var v=currentPolicy[key]||0;
+      return '<label style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;gap:12px;"><div><span>'+label+'</span>'+(hint?'<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">'+hint+'</div>':'')+'</div><input type="number" data-key="'+key+'" value="'+v+'" style="width:80px;background:var(--bg-app);border:1px solid var(--border);color:var(--text-main);padding:6px 8px;border-radius:6px;text-align:right;font-size:13px;"></label>';
+    }
+
+    function boolField(label,key,hint){
+      var v=currentPolicy[key];
+      return '<label style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;gap:12px;cursor:pointer;"><div><span>'+label+'</span>'+(hint?'<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">'+hint+'</div>':'')+'</div><input type="checkbox" data-key="'+key+'"'+(v?' checked':'')+' style="width:18px;height:18px;accent-color:#4ade80;cursor:pointer;"></label>';
+    }
+
+    function textField(label,key,hint){
+      var v=currentPolicy[key]||'';
+      return '<label style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;gap:12px;"><div><span>'+label+'</span>'+(hint?'<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">'+hint+'</div>':'')+'</div><input type="text" data-key="'+key+'" value="'+v+'" style="width:180px;background:var(--bg-app);border:1px solid var(--border);color:var(--text-main);padding:6px 8px;border-radius:6px;font-size:13px;font-family:monospace;"></label>';
+    }
+
+    function gateField(label,key,hint){
+      var gates=currentPolicy.gates||{};var v=gates[key];
+      return '<label style="display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;gap:12px;cursor:pointer;"><div><span>'+label+'</span>'+(hint?'<div style="font-size:11px;color:var(--text-muted);margin-top:2px;">'+hint+'</div>':'')+'</div><input type="checkbox" data-gate="'+key+'"'+(v?' checked':'')+' style="width:18px;height:18px;accent-color:#4ade80;cursor:pointer;"></label>';
+    }
+
+    function render(){
+      document.getElementById('run-params').innerHTML=[
+        numField('Max Hours','maxHours','Max duration for a single run'),
+        numField('Max Commits','maxCommits','Max commits per run'),
+        numField('Max Parallel Tasks','maxParallelTasks','Concurrent task limit'),
+        numField('Max Retries/Task','maxRetriesPerTask','Retry attempts on failure'),
+        numField('Max Minutes/Task','maxMinutesPerTask','Per-task timeout (0=unlimited)'),
+        numField('Max Improvement Cycles','maxImprovementCycles','Review-improve iterations'),
+        boolField('Auto-Approve Plan','autoApprovePlan','Skip manual plan approval')
+      ].join('');
+
+      document.getElementById('token-params').innerHTML=[
+        numField('Max Tokens/Run','maxTokensPerRun','Total token budget per run (0=unlimited)'),
+        numField('Max Tokens/Task','maxTokensPerTask','Per-task token budget (0=unlimited)')
+      ].join('');
+
+      document.getElementById('gate-toggles').innerHTML=[
+        gateField('TypeScript Check','runTypecheck','Run tsc --noEmit or npm run typecheck'),
+        gateField('Lint','runLint','Run npm run lint'),
+        gateField('Tests','runTests','Run npm run test'),
+        gateField('Build','runBuild','Run npm run build'),
+        gateField('Runtime Gate','runRuntime','Start dev server and probe'),
+        gateField('Require Runtime for UI','requireRuntimeForUi','Fail if runtime gate skipped on UI tasks'),
+        gateField('Capture Snapshot','captureSnapshot','Take screenshot after runtime gate'),
+        gateField('Security Scan','runSecurityScan','Scan for hardcoded secrets/credentials'),
+        gateField('Import Cycle Check','runImportCycleCheck','Detect circular import chains')
+      ].join('');
+
+      document.getElementById('branch-config').innerHTML=[
+        textField('Integration Branch','integrationBranchName','Branch name for autonomous commits')
+      ].join('');
+    }
+
+    async function load(){
+      var url=project?'/api/policies/'+encodeURIComponent(project):'/api/policies/default';
+      var r=await fetch(url);currentPolicy=await r.json();render();
+    }
+
+    function collectPolicy(){
+      document.querySelectorAll('[data-key]').forEach(function(el){
+        var k=el.dataset.key;
+        if(el.type==='checkbox') currentPolicy[k]=el.checked;
+        else if(el.type==='number') currentPolicy[k]=Number(el.value);
+        else currentPolicy[k]=el.value;
+      });
+      if(!currentPolicy.gates)currentPolicy.gates={};
+      document.querySelectorAll('[data-gate]').forEach(function(el){
+        currentPolicy.gates[el.dataset.gate]=el.checked;
+      });
+    }
+
+    document.getElementById('save-btn').onclick=async function(){
+      collectPolicy();
+      var url=project?'/api/policies/'+encodeURIComponent(project):'/api/policies/default';
+      await fetch(url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify(currentPolicy)});
+      document.getElementById('save-status').textContent='Saved!';
+      setTimeout(function(){document.getElementById('save-status').textContent='';},2000);
+    };
+
+    document.querySelectorAll('.preset-btn').forEach(function(btn){
+      btn.onclick=async function(){
+        var url=project?'/api/policies/'+encodeURIComponent(project):'/api/policies/default';
+        await fetch(url,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({preset:btn.dataset.preset})});
+        await load();
+        document.getElementById('save-status').textContent='Preset applied!';
+        setTimeout(function(){document.getElementById('save-status').textContent='';},2000);
+      };
+    });
+
+    load();
+  `);
+}
+
+function buildLearningPage(): string {
+  return shellPage('Learning', '/learning', `
+    <h1 class="page-title">Learning Patterns</h1>
+    <p class="page-subtitle">Patterns extracted from successful tasks. Higher effectiveness scores mean more reliable guidance for future runs.</p>
+
+    <div class="card-grid" id="learning-stats"></div>
+
+    <h2 class="section-title section-gap">Pattern Browser</h2>
+    <div style="display:flex;gap:12px;margin-bottom:16px;">
+      <input id="pat-search" type="text" placeholder="Search patterns..." style="flex:1;background:var(--bg-surface);border:1px solid var(--border);color:var(--text-main);padding:10px 14px;border-radius:8px;font-size:13px;outline:none;">
+      <select id="pat-kind-filter" style="background:var(--bg-surface);border:1px solid var(--border);color:var(--text-main);padding:10px 14px;border-radius:8px;font-size:13px;outline:none;">
+        <option value="all">All Kinds</option>
+        <option value="implement">implement</option><option value="improve">improve</option>
+        <option value="heal">heal</option><option value="review">review</option>
+      </select>
+    </div>
+    <div id="pattern-list"></div>
+
+    <div id="pattern-detail" style="display:none;margin-top:24px;">
+      <h2 class="section-title">Pattern Detail</h2>
+      <div id="detail-content"></div>
+      <h3 style="font-size:14px;font-weight:500;margin:16px 0 8px;">Application Outcomes</h3>
+      <table id="outcome-table"><thead><tr><th>Task</th><th>Run</th><th>Result</th><th>Iterations</th><th>Date</th></tr></thead><tbody></tbody></table>
+    </div>
+  `, `
+    function safe(v){return String(v||'').replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+    function bar(ratio,color){return '<div style="height:8px;background:var(--bg-app);border-radius:99px;overflow:hidden;width:80px;display:inline-block;vertical-align:middle;"><div style="height:100%;border-radius:99px;width:'+Math.max(0,Math.round(ratio*50+50))+'%;background:'+color+'"></div></div>';}
+    var allPatterns=[];
+    var selectedPatternId=null;
+
+    function effColor(s){return s>0.3?'#4ade80':s<-0.1?'#f87171':'#f59e0b';}
+
+    function renderPatterns(){
+      var search=(document.getElementById('pat-search').value||'').toLowerCase();
+      var kind=document.getElementById('pat-kind-filter').value;
+      var filtered=allPatterns.filter(function(p){
+        if(kind!=='all'&&p.taskKind!==kind)return false;
+        if(search&&![p.taskKind,p.filePattern,p.approach,p.projectName].join(' ').toLowerCase().includes(search))return false;
+        return true;
+      });
+
+      document.getElementById('pattern-list').innerHTML=filtered.length?filtered.map(function(p){
+        var c=effColor(p.effectivenessScore);
+        var active=selectedPatternId===p.id?' style="border-color:#71717a;background:linear-gradient(180deg,rgba(39,39,42,0.95),rgba(24,24,27,0.98));"':'';
+        return '<div class="card" data-pid="'+safe(p.id)+'"'+active+' style="margin-bottom:8px;cursor:pointer;transition:all 0.15s;'+(selectedPatternId===p.id?'border-color:#71717a;':'')+'"><div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:8px;"><div><span style="font-weight:500;font-size:14px;">'+safe(p.taskKind)+'</span><span style="font-family:monospace;font-size:12px;color:var(--text-muted);margin-left:12px;">'+safe(p.filePattern)+'</span></div><div style="display:flex;align-items:center;gap:8px;">'+bar(p.effectivenessScore,c)+'<span style="font-size:13px;font-weight:500;color:'+c+';min-width:40px;text-align:right;">'+(p.effectivenessScore*100).toFixed(0)+'%</span></div></div><div style="font-size:12px;color:var(--text-muted);margin-bottom:8px;max-height:40px;overflow:hidden;">'+safe(p.approach?.slice(0,200))+'</div><div style="display:flex;gap:16px;font-size:12px;color:var(--text-muted);"><span>Applied: '+p.timesApplied+'</span><span style="color:#4ade80">Succeeded: '+p.timesSucceeded+'</span><span style="color:#f87171">Failed: '+p.timesFailed+'</span><span>Project: '+safe(p.projectName)+'</span></div></div>';
+      }).join(''):'<div class="muted" style="padding:24px;text-align:center;">No patterns match your filters.</div>';
+
+      document.querySelectorAll('[data-pid]').forEach(function(el){
+        el.onclick=function(){selectPattern(el.dataset.pid);};
+      });
+    }
+
+    async function selectPattern(id){
+      selectedPatternId=id;
+      renderPatterns();
+      var p=allPatterns.find(function(x){return x.id===id;});
+      if(!p){document.getElementById('pattern-detail').style.display='none';return;}
+
+      document.getElementById('pattern-detail').style.display='block';
+      var c=effColor(p.effectivenessScore);
+      document.getElementById('detail-content').innerHTML='<div class="card"><div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px;">'
+        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Task Kind</div><div style="font-weight:500;">'+safe(p.taskKind)+'</div></div>'
+        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">File Pattern</div><div style="font-family:monospace;font-size:12px;">'+safe(p.filePattern)+'</div></div>'
+        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Effectiveness</div><div style="font-weight:500;color:'+c+'">'+(p.effectivenessScore*100).toFixed(1)+'%</div></div>'
+        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Project</div><div>'+safe(p.projectName)+'</div></div>'
+        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Times Applied</div><div>'+p.timesApplied+' ('+p.timesSucceeded+' ok, '+p.timesFailed+' fail)</div></div>'
+        +'<div><div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:4px;">Iterations</div><div>'+(p.iterations||'—')+'</div></div>'
+        +'</div>'
+        +'<div style="font-size:11px;text-transform:uppercase;color:var(--text-muted);font-weight:600;margin-bottom:6px;">Approach</div>'
+        +'<pre style="background:var(--bg-app);padding:12px;border-radius:8px;border:1px solid var(--border);">'+safe(p.approach)+'</pre>'
+        +(p.tags&&p.tags.length?'<div style="margin-top:12px;display:flex;gap:6px;flex-wrap:wrap;">'+p.tags.map(function(t){return '<span style="padding:2px 8px;border-radius:99px;background:var(--bg-app);border:1px solid var(--border);font-size:11px;color:var(--text-muted);">'+safe(t)+'</span>';}).join('')+'</div>':'')
+        +'</div>';
+
+      // Load outcomes
+      try{
+        var r=await fetch('/api/learning/patterns/'+encodeURIComponent(id)+'/outcomes');
+        var outcomes=await r.json();
+        var otb=document.querySelector('#outcome-table tbody');
+        otb.innerHTML=outcomes.length?outcomes.map(function(o){
+          var rc=o.succeeded?'#4ade80':'#f87171';
+          return '<tr><td style="font-family:monospace;font-size:12px">'+safe(o.taskId?.slice(0,12))+'</td><td style="font-family:monospace;font-size:12px">'+safe(o.runId?.slice(0,12))+'</td><td style="color:'+rc+';font-weight:500">'+(o.succeeded?'success':'failure')+'</td><td>'+(o.iterationsUsed||'—')+'</td><td style="color:var(--text-muted);font-size:12px">'+safe(o.createdAt?.slice(0,10))+'</td></tr>';
+        }).join(''):'<tr><td colspan="5" class="muted">No outcomes recorded for this pattern.</td></tr>';
+      }catch(e){console.error(e);}
+    }
+
+    async function load(){
+      const [statsR,patternsR]=await Promise.all([
+        fetch('/api/learning/stats'),fetch('/api/learning/patterns?limit=100')
+      ]);
+      const stats=await statsR.json();
+      allPatterns=await patternsR.json();
+
+      document.getElementById('learning-stats').innerHTML=[
+        ['Total Patterns',stats.totalPatterns,'#60a5fa'],['Effective',stats.effectivePatterns,'#4ade80'],
+        ['Applications',stats.totalApplications,'#a78bfa'],['Success Rate',(stats.overallSuccessRate*100).toFixed(1)+'%','#4ade80'],
+        ['Avg Iterations',stats.avgIterationsLearned?.toFixed(1)||'—','#f59e0b']
+      ].map(function(c){return '<div class="card"><div class="card-label">'+c[0]+'</div><div class="card-value" style="color:'+c[2]+'">'+c[1]+'</div></div>';}).join('');
+
+      renderPatterns();
+    }
+
+    document.getElementById('pat-search').addEventListener('input',renderPatterns);
+    document.getElementById('pat-kind-filter').addEventListener('change',renderPatterns);
+    load();
+  `);
+}
+
 export function startUnityHttpServer(runtime: RuntimeState) {
   const config = getRuntimeConfig();
 
@@ -1547,6 +2137,26 @@ export function startUnityHttpServer(runtime: RuntimeState) {
 
       if (req.method === 'GET' && pathname === '/') {
         sendHtml(res, buildHomePageShell());
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/analytics') {
+        sendHtml(res, buildAnalyticsPage());
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/knowledge') {
+        sendHtml(res, buildKnowledgePage());
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/settings') {
+        sendHtml(res, buildSettingsPage());
+        return;
+      }
+
+      if (req.method === 'GET' && pathname === '/learning') {
+        sendHtml(res, buildLearningPage());
         return;
       }
 
@@ -1625,6 +2235,11 @@ export function startUnityHttpServer(runtime: RuntimeState) {
         return;
       }
 
+      if (req.method === 'GET' && pathname === '/api/runs/resumable') {
+        sendJson(res, 200, unityStore.listResumableRuns());
+        return;
+      }
+
       if (req.method === 'GET' && extractRunId(pathname)) {
         const runId = extractRunId(pathname) as string;
         const payload = buildRunPayload(runId);
@@ -1658,6 +2273,12 @@ export function startUnityHttpServer(runtime: RuntimeState) {
       if (req.method === 'GET' && extractRunId(pathname, '/artifacts')) {
         const runId = extractRunId(pathname, '/artifacts') as string;
         sendJson(res, 200, unityStore.listArtifactsByRun(runId));
+        return;
+      }
+
+      if (req.method === 'GET' && extractRunId(pathname, '/plans')) {
+        const runId = extractRunId(pathname, '/plans') as string;
+        sendJson(res, 200, unityStore.listPlansByRun(runId));
         return;
       }
 
@@ -1778,6 +2399,13 @@ export function startUnityHttpServer(runtime: RuntimeState) {
         const limit = Number(url.searchParams.get('limit') || 20);
         const learningStore = getLearningStore();
         sendJson(res, 200, learningStore.getTopPatterns(limit));
+        return;
+      }
+
+      if (req.method === 'GET' && pathname.startsWith('/api/learning/patterns/') && pathname.endsWith('/outcomes')) {
+        const patternId = pathname.slice('/api/learning/patterns/'.length, -'/outcomes'.length);
+        const learningStore = getLearningStore();
+        sendJson(res, 200, learningStore.getPatternOutcomes(patternId));
         return;
       }
 
@@ -1913,6 +2541,81 @@ export function startUnityHttpServer(runtime: RuntimeState) {
           affectedPaths: Array.isArray(body.affectedPaths) ? body.affectedPaths : [],
         });
         sendJson(res, 201, { ok: true, id });
+        return;
+      }
+
+      /* ── Telemetry: Gate Stats ── */
+
+      if (req.method === 'GET' && pathname === '/api/telemetry/gate-stats') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const days = Number(url.searchParams.get('days') || 30);
+        const telemetryStore = getTelemetryStore();
+        sendJson(res, 200, telemetryStore.getGateStats(projectName, days));
+        return;
+      }
+
+      /* ── Telemetry: Edit Metrics ── */
+
+      if (req.method === 'GET' && pathname === '/api/telemetry/edit-metrics') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const days = Number(url.searchParams.get('days') || 30);
+        const telemetryStore = getTelemetryStore();
+        sendJson(res, 200, telemetryStore.getEditMetrics(projectName, days));
+        return;
+      }
+
+      /* ── Per-Task Cost Breakdown ── */
+
+      if (req.method === 'GET' && extractRunId(pathname, '/task-costs')) {
+        const runId = extractRunId(pathname, '/task-costs') as string;
+        const telemetryStore = getTelemetryStore();
+        sendJson(res, 200, telemetryStore.getTaskCosts(runId));
+        return;
+      }
+
+      /* ── Knowledge: Module List ── */
+
+      if (req.method === 'GET' && pathname === '/api/knowledge/modules') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const kg = getKnowledgeGraph();
+        sendJson(res, 200, kg.listModules(projectName));
+        return;
+      }
+
+      /* ── Knowledge: API Endpoints ── */
+
+      if (req.method === 'GET' && pathname === '/api/knowledge/api-endpoints') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const kg = getKnowledgeGraph();
+        sendJson(res, 200, kg.listApiEndpoints(projectName));
+        return;
+      }
+
+      /* ── Knowledge: File Change Attribution ── */
+
+      if (req.method === 'GET' && pathname === '/api/knowledge/file-changes') {
+        const projectName = url.searchParams.get('project') || getRuntimeConfig().githubRepo;
+        const limit = Number(url.searchParams.get('limit') || 50);
+        const kg = getKnowledgeGraph();
+        sendJson(res, 200, kg.getFileChangesWithAttribution(projectName, limit));
+        return;
+      }
+
+      /* ── Policy CRUD ── */
+
+      if (req.method === 'GET' && pathname.startsWith('/api/policies/')) {
+        const projectName = decodeURIComponent(pathname.slice('/api/policies/'.length));
+        sendJson(res, 200, getProjectPolicy(unityStore, projectName));
+        return;
+      }
+
+      if (req.method === 'PUT' && pathname.startsWith('/api/policies/')) {
+        const projectName = decodeURIComponent(pathname.slice('/api/policies/'.length));
+        const body = await readJsonBody(req);
+        const current = getProjectPolicy(unityStore, projectName);
+        const updated = normalizePolicy({ ...current, ...body });
+        unityStore.upsertPolicy(projectName, updated);
+        sendJson(res, 200, { ok: true, policy: updated });
         return;
       }
 

@@ -152,13 +152,13 @@ export async function prepareWorkspace(project: WorkspaceProject): Promise<Prepa
 
   if (!fs.existsSync(project.repoPath)) {
     console.log(`📥 Cloning ${project.name}...`);
-    await execPromise(`git clone "${getRepoUrl(project)}" "${project.repoPath}"`);
+    await execFilePromise('git', ['clone', getRepoUrl(project), project.repoPath]);
   } else {
     console.log(`🔄 Resetting and updating ${project.name} for a fresh start...`);
     await resetWorkspace(project);
-    await execPromise(`git remote set-url origin "${getRepoUrl(project)}"`, { cwd: project.repoPath }).catch(() => {});
-    await execPromise(`git checkout ${getBaseBranch()}`, { cwd: project.repoPath });
-    await execPromise(`git pull origin ${getBaseBranch()}`, { cwd: project.repoPath });
+    await execFilePromise('git', ['remote', 'set-url', 'origin', getRepoUrl(project)], { cwd: project.repoPath }).catch(() => {});
+    await execFilePromise('git', ['checkout', getBaseBranch()], { cwd: project.repoPath });
+    await execFilePromise('git', ['pull', 'origin', getBaseBranch()], { cwd: project.repoPath });
   }
 
   const targets = scanWorkspaceTargets(project.repoPath);
@@ -174,7 +174,7 @@ export async function prepareWorkspace(project: WorkspaceProject): Promise<Prepa
 
 export async function getRepositoryStatus(project: WorkspaceProject): Promise<string> {
   try {
-    const { stdout } = await execPromise(`git status --porcelain`, { cwd: project.repoPath });
+    const { stdout } = await execFilePromise('git', ['status', '--porcelain'], { cwd: project.repoPath });
     return stdout || '';
   } catch {
     return '';
@@ -183,7 +183,7 @@ export async function getRepositoryStatus(project: WorkspaceProject): Promise<st
 
 export async function getRepositoryDiff(project: WorkspaceProject): Promise<string> {
   try {
-    const { stdout } = await execPromise(`git diff`, { cwd: project.repoPath });
+    const { stdout } = await execFilePromise('git', ['diff'], { cwd: project.repoPath });
     return stdout || '';
   } catch {
     return '';
@@ -191,8 +191,8 @@ export async function getRepositoryDiff(project: WorkspaceProject): Promise<stri
 }
 
 export async function resetWorkspace(project: WorkspaceProject): Promise<void> {
-  await execPromise(`git reset --hard HEAD`, { cwd: project.repoPath }).catch(() => {});
-  await execPromise(`git clean -fd`, { cwd: project.repoPath }).catch(() => {});
+  await execFilePromise('git', ['reset', '--hard', 'HEAD'], { cwd: project.repoPath }).catch(() => {});
+  await execFilePromise('git', ['clean', '-fd'], { cwd: project.repoPath }).catch(() => {});
 }
 
 export async function createPullRequest(
@@ -231,10 +231,10 @@ export async function createPullRequest(
     if (!prResponse.ok) throw new Error(await prResponse.text());
 
     const prData = await prResponse.json();
-    await execPromise(`git checkout ${getBaseBranch()}`, { cwd: workspace.repoPath });
+    await execFilePromise('git', ['checkout', getBaseBranch()], { cwd: workspace.repoPath });
     return prData.html_url;
   } catch (error) {
-    await execPromise(`git checkout ${getBaseBranch()}`, { cwd: workspace.repoPath }).catch(() => {});
+    await execFilePromise('git', ['checkout', getBaseBranch()], { cwd: workspace.repoPath }).catch(() => {});
     throw error;
   }
 }
@@ -245,12 +245,12 @@ export async function scaffoldProject(type: string, name: string, workspaceDir: 
   }
 
   if (type === 'expo') {
-    await execPromise(`npx create-expo-app ${name} --template blank-typescript`, { cwd: workspaceDir });
+    await execFilePromise('npx', ['create-expo-app', name, '--template', 'blank-typescript'], { cwd: workspaceDir });
     return;
   }
 
   if (type === 'nest') {
-    await execPromise(`npx @nestjs/cli new ${name} --package-manager npm --skip-git`, { cwd: workspaceDir });
+    await execFilePromise('npx', ['@nestjs/cli', 'new', name, '--package-manager', 'npm', '--skip-git'], { cwd: workspaceDir });
     return;
   }
 

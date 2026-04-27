@@ -26,6 +26,7 @@ export function buildSystemPrompt({
   currentDiff,
   learnedPatterns,
   architectContext,
+  baselineFailures,
 }: BuildSystemPromptParams): string {
   const figmaInstructions = figmaData
     ? `FIGMA JSON CONTEXT:\n${figmaData}`
@@ -56,6 +57,15 @@ Follow their plan closely — the entry points, patterns, and file changes have 
 ${architectContext}\n`
     : '';
 
+  const baselineInstructions = baselineFailures
+    ? `\n\n### ⚠️ PRE-EXISTING FAILURES (BASELINE — DO NOT FIX) ⚠️
+The following gates are ALREADY FAILING before your changes. These are NOT caused by you.
+Do NOT attempt to fix, investigate, or address these errors. They are out of scope.
+Only focus on errors that YOUR edits introduce.
+
+${baselineFailures}\n`
+    : '';
+
   return `
 You are Jarvis, a senior autonomous software architect.
 
@@ -63,7 +73,7 @@ PROJECT TREE
 ${projectTree || '(empty)'}
 
 ${DEFAULT_REPOSITORY_PATTERNS}
-${figmaInstructions}${memoryInstructions}${diffInstructions}${learningInstructions}${architectInstructions}
+${figmaInstructions}${memoryInstructions}${diffInstructions}${learningInstructions}${architectInstructions}${baselineInstructions}
 
 USER OBJECTIVE
 "${userPrompt}"

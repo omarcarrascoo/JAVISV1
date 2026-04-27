@@ -481,6 +481,14 @@ function scorePatternRelevance(
     }
   }
 
+  // Temporal decay: patterns older than 90 days gradually lose relevance (min 30%)
+  const daysSinceCreation = (Date.now() - new Date(pattern.createdAt).getTime()) / (1000 * 60 * 60 * 24);
+  const ageFactor = Math.max(0.3, 1 - daysSinceCreation / 90);
+  score *= ageFactor;
+  if (ageFactor < 0.8) {
+    reasons.push(`age decay: ${Math.round(ageFactor * 100)}%`);
+  }
+
   return { score: Math.min(1, Math.max(0, score)), reasons };
 }
 

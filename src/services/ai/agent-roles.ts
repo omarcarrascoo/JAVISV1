@@ -11,10 +11,15 @@
  * The pipeline is: Explorer → Architect → Implementer (→ Reviewer handled separately)
  */
 
+import { exec } from 'child_process';
+import util from 'util';
 import { roleCompletion } from './completion.js';
+import { detectSpiralPattern, measureInformationGain, countUniqueFilesRead } from './loop-heuristics.js';
 import type { LLMMessage } from './providers/types.js';
 import { createAgentToolRuntime, agentTools } from '../../tools.js';
 import { getKnowledgeGraph } from '../knowledge/index.js';
+
+const execPromise = util.promisify(exec);
 
 /* ── Tool Set Definitions ── */
 
@@ -221,6 +226,7 @@ export async function runExplorerAgent(params: {
 
   let totalTokens = 0;
   const maxLoops = 30;
+  const explorerToolHistory: string[] = [];
 
   for (let loop = 1; loop <= maxLoops; loop++) {
     if (params.signal?.aborted) throw new Error('AbortError');
@@ -246,6 +252,34 @@ export async function runExplorerAgent(params: {
     });
 
     if (toolCalls.length) {
+      // Record tool descriptors for spiral detection
+      for (const toolCall of toolCalls) {
+        try {
+          const args = JSON.parse(toolCall.function.arguments || '{}');
+          explorerToolHistory.push(`${toolCall.function.name}:${args.filepath || args.pattern || args.keyword || args.symbol || ''}`);
+        } catch {
+          explorerToolHistory.push(`${toolCall.function.name}:`);
+        }
+      }
+
+      // Spiral detection: if Explorer is stuck, force it to produce report
+      const isSpiral = detectSpiralPattern(explorerToolHistory);
+      const gain = measureInformationGain(explorerToolHistory);
+      const shouldExit = isSpiral || (loop >= 15 && gain === 'stale' && countUniqueFilesRead(explorerToolHistory) >= 2);
+
+      if (shouldExit) {
+        // Skip tool execution and ask for the report
+        for (const tc of toolCalls) {
+          messages.push({ role: 'tool', tool_call_id: tc.id, name: tc.function.name, content: '[Skipped — produce your exploration report now]' });
+        }
+        messages.push({
+          role: 'user',
+          content: 'You are repeating the same exploration patterns. You have enough context. Return your exploration report as a JSON object NOW with: entryPoints, patterns, dependencies, risks, approach, keySnippets.',
+        });
+        params.onProgress?.(`⚠️ Explorer spiral detected at iteration ${loop}, forcing report.`);
+        continue;
+      }
+
       for (const toolCall of toolCalls) {
         let result = '';
         try {
@@ -279,18 +313,85 @@ export async function runExplorerAgent(params: {
     });
   }
 
-  // Fallback: return a minimal report
+  // Fallback: attempt keyword-based file search before returning empty
+  const fallbackEntryPoints = await findEntryPointsByKeywords(params.repoPath, params.userPrompt);
+
   return {
     report: {
-      entryPoints: [],
-      patterns: 'Explorer reached iteration limit without producing a report.',
+      entryPoints: fallbackEntryPoints,
+      patterns: fallbackEntryPoints.length > 0
+        ? `Explorer reached iteration limit but keyword search found ${fallbackEntryPoints.length} candidate file(s).`
+        : 'Explorer reached iteration limit without producing a report.',
       dependencies: [],
-      risks: 'Exploration incomplete.',
-      approach: 'Proceed with direct implementation.',
+      risks: 'Exploration incomplete — entry points found via keyword fallback.',
+      approach: fallbackEntryPoints.length > 0
+        ? `Start by reading: ${fallbackEntryPoints.join(', ')}`
+        : 'Proceed with direct implementation.',
       keySnippets: {},
     },
     tokensUsed: totalTokens,
   };
+}
+
+/**
+ * Keyword-based file search fallback when Explorer returns 0 entry points.
+ * Extracts meaningful keywords from the task prompt and searches for matching files.
+ */
+async function findEntryPointsByKeywords(repoPath: string, userPrompt: string): Promise<string[]> {
+  try {
+    // Extract keywords: words 4+ chars, lowercased, deduplicated, skip common stop words
+    const stopWords = new Set([
+      'that', 'this', 'with', 'from', 'have', 'will', 'should', 'would', 'could',
+      'make', 'create', 'update', 'implement', 'change', 'modify', 'ensure', 'need',
+      'also', 'must', 'using', 'into', 'when', 'where', 'what', 'which', 'their',
+      'them', 'been', 'being', 'each', 'some', 'more', 'only', 'very', 'than',
+      'then', 'just', 'about', 'after', 'before', 'between', 'through', 'during',
+    ]);
+
+    const keywords = [...new Set(
+      userPrompt
+        .replace(/[^a-zA-Z0-9_\-/.]/g, ' ')
+        .split(/\s+/)
+        .filter((w) => w.length >= 4 && !stopWords.has(w.toLowerCase()))
+        .map((w) => w.toLowerCase()),
+    )].slice(0, 6); // Max 6 keywords
+
+    if (keywords.length === 0) return [];
+
+    const entryPoints = new Set<string>();
+
+    for (const keyword of keywords) {
+      try {
+        // Search for files with the keyword in their name
+        const { stdout: fileResults } = await execPromise(
+          `find . -type f \\( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \\) -ipath "*${keyword}*" | head -5`,
+          { cwd: repoPath, timeout: 5000 },
+        );
+        for (const line of fileResults.split('\n').filter(Boolean)) {
+          entryPoints.add(line.replace(/^\.\//, ''));
+        }
+
+        // If file name search didn't find enough, search file contents
+        if (entryPoints.size < 3) {
+          const { stdout: grepResults } = await execPromise(
+            `grep -rl --include="*.ts" --include="*.tsx" -i "${keyword}" . | head -3`,
+            { cwd: repoPath, timeout: 5000 },
+          );
+          for (const line of grepResults.split('\n').filter(Boolean)) {
+            entryPoints.add(line.replace(/^\.\//, ''));
+          }
+        }
+      } catch {
+        // Individual keyword search failed — continue with others
+      }
+
+      if (entryPoints.size >= 8) break; // Enough candidates
+    }
+
+    return Array.from(entryPoints).slice(0, 8);
+  } catch {
+    return [];
+  }
 }
 
 function normalizeExplorationReport(raw: Partial<ExplorationReport>): ExplorationReport {

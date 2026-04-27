@@ -12,6 +12,7 @@ import {
   isFatalToolError,
 } from './loop-heuristics.js';
 import { roleCompletion } from './completion.js';
+import { telemetry } from '../telemetry/index.js';
 import type { LLMMessage } from './providers/types.js';
 import type { AIResponse, GenerateCodeParams } from './types.js';
 
@@ -28,7 +29,7 @@ export async function generateAndWriteCode({
   taskId,
   learnedPatterns,
   architectContext,
-}: GenerateCodeParams): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number }> {
+}: GenerateCodeParams): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number; iterations: number; toolHistory: string[]; filesRead: string[] }> {
   const toolRuntime = createAgentToolRuntime(repoPath);
   const messages: LLMMessage[] = [
     {
@@ -50,16 +51,22 @@ export async function generateAndWriteCode({
   const maxLoops = 100;
   let totalTokens = 0;
   const toolHistory: string[] = [];
+  const filesReadSet = new Set<string>();
+  let consecutiveRedirects = 0;
+  let finalLoop = 0;
 
   for (let loop = 1; loop <= maxLoops; loop++) {
+    finalLoop = loop;
     if (signal?.aborted) throw new Error('AbortError');
 
     const statusMsg = `🔄 Iteration ${loop}... Thinking...`;
     if (onStatusUpdate) onStatusUpdate(statusMsg);
 
+    // After 3+ consecutive redirects, strip tools to force JSON output
+    const enforceJsonOnly = consecutiveRedirects >= 3;
     const response = await roleCompletion('code-gen', {
       messages,
-      tools: toolRuntime.tools as any,
+      tools: enforceJsonOnly ? undefined : (toolRuntime.tools as any),
       signal,
       runId,
       taskId,
@@ -81,9 +88,23 @@ export async function generateAndWriteCode({
     const agentThought = agentContent;
 
     if (agentToolCalls.length) {
+      // Record tool descriptors BEFORE evaluating loop control so heuristics
+      // see the current iteration's tools (fixes off-by-1 spiral detection)
+      for (const tc of agentToolCalls) {
+        try {
+          const args = JSON.parse(tc.function.arguments || '{}');
+          const primaryArg = args.filepath || args.keyword || args.pattern || args.symbol || args.cmd || args.path || '';
+          toolHistory.push(`${tc.function.name}:${primaryArg}`);
+        } catch {
+          toolHistory.push(`${tc.function.name}:`);
+        }
+      }
+
       const loopControl = evaluateLoopControl(toolHistory, loop, totalTokens);
 
       if (loopControl.shouldRedirect) {
+        consecutiveRedirects++;
+
         // Must respond to every tool_call before adding a user message
         for (const tc of agentToolCalls) {
           messages.push({
@@ -94,17 +115,40 @@ export async function generateAndWriteCode({
           });
         }
 
+        const escalation = consecutiveRedirects >= 3
+          ? `\n\n🛑 HARD REDIRECT (${consecutiveRedirects} consecutive redirects): Tools have been DISABLED. You MUST respond with ONLY a JSON object containing your implementation (edits, targetRoute, commitMessage). No tool calls will be accepted.`
+          : '';
+
         messages.push({
           role: 'user',
-          content: loopControl.reason,
+          content: loopControl.reason + escalation,
         });
 
         if (onStatusUpdate) {
-          onStatusUpdate('⚠️ Jarvis was redirected to implementation.');
+          onStatusUpdate(
+            consecutiveRedirects >= 3
+              ? `🛑 Hard redirect enforced — tools stripped (redirect #${consecutiveRedirects}).`
+              : '⚠️ Jarvis was redirected to implementation.',
+          );
+        }
+
+        // Emit telemetry for redirect spirals (every redirect after the first)
+        if (runId && taskId && consecutiveRedirects >= 2) {
+          telemetry.redirectSpiral({
+            runId,
+            taskId,
+            projectName: '',
+            consecutiveRedirects,
+            iterationCount: loop,
+            toolsStripped: consecutiveRedirects >= 3,
+          });
         }
 
         continue;
       }
+
+      // Agent is making productive tool calls — reset redirect counter
+      consecutiveRedirects = 0;
 
       for (const toolCall of agentToolCalls) {
         const functionName = toolCall.function.name;
@@ -113,8 +157,6 @@ export async function generateAndWriteCode({
         try {
           const args = JSON.parse(toolCall.function.arguments || '{}');
           const primaryArg = args.filepath || args.keyword || args.pattern || args.symbol || args.cmd || args.path || '';
-          const toolDescriptor = `${functionName}:${primaryArg}`;
-          toolHistory.push(toolDescriptor);
 
           if (onStatusUpdate) {
             onStatusUpdate(
@@ -124,6 +166,11 @@ export async function generateAndWriteCode({
           }
 
           toolResult = await toolRuntime.executeTool(functionName, args);
+
+          // Track file reads explicitly for learning patterns
+          if (functionName === 'read_file' && args.filepath) {
+            filesReadSet.add(args.filepath);
+          }
 
           if (isFatalToolError(toolResult)) {
             throw new Error(toolResult);
@@ -290,5 +337,8 @@ Re-check that your JSON accurately matches the code changes you made and return 
     targetRoute: finalResult.targetRoute || '/',
     commitMessage: finalResult.commitMessage || 'feat: auto-update',
     tokenUsage: totalTokens,
+    iterations: finalLoop,
+    toolHistory,
+    filesRead: Array.from(filesReadSet),
   };
 }

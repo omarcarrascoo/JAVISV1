@@ -30,8 +30,8 @@ export interface BudgetCheck {
 }
 
 const DEFAULT_BUDGET: TokenBudget = {
-  maxTokensPerRun: 2_000_000,
-  maxTokensPerTask: 500_000,
+  maxTokensPerRun: 0,     // 0 = unlimited (track but don't enforce)
+  maxTokensPerTask: 0,    // 0 = unlimited (track but don't enforce)
   warningThreshold: 0.75,
 };
 
@@ -77,8 +77,8 @@ export class TokenTracker {
 
     const { maxTokensPerRun, maxTokensPerTask, warningThreshold } = this.budget;
 
-    // Hard stop: task exceeded
-    if (taskId && taskUsed >= maxTokensPerTask) {
+    // 0 means unlimited — skip enforcement
+    if (taskId && maxTokensPerTask > 0 && taskUsed >= maxTokensPerTask) {
       return {
         status: 'exceeded',
         runUsed,
@@ -87,8 +87,7 @@ export class TokenTracker {
       };
     }
 
-    // Hard stop: run exceeded
-    if (runUsed >= maxTokensPerRun) {
+    if (maxTokensPerRun > 0 && runUsed >= maxTokensPerRun) {
       return {
         status: 'exceeded',
         runUsed,
@@ -97,8 +96,7 @@ export class TokenTracker {
       };
     }
 
-    // Warning: task approaching limit
-    if (taskId && taskUsed >= maxTokensPerTask * warningThreshold) {
+    if (taskId && maxTokensPerTask > 0 && taskUsed >= maxTokensPerTask * warningThreshold) {
       const pct = Math.round((taskUsed / maxTokensPerTask) * 100);
       return {
         status: 'warning',
@@ -108,8 +106,7 @@ export class TokenTracker {
       };
     }
 
-    // Warning: run approaching limit
-    if (runUsed >= maxTokensPerRun * warningThreshold) {
+    if (maxTokensPerRun > 0 && runUsed >= maxTokensPerRun * warningThreshold) {
       const pct = Math.round((runUsed / maxTokensPerRun) * 100);
       return {
         status: 'warning',

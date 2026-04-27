@@ -1,5 +1,9 @@
 import path from 'path';
+import { exec } from 'child_process';
+import util from 'util';
 import { getRuntimeConfig, getProjectByName } from '../config.js';
+
+const execPromise = util.promisify(exec);
 import { getFigmaContext } from '../figma.js';
 import { prepareWorkspace } from '../git.js';
 import { getProjectMemory, getProjectTree } from '../scanner.js';
@@ -300,9 +304,13 @@ ${task.prompt}`;
 }
 
 function buildDependencyContext(task: TaskRecord, tasks: TaskRecord[]): string {
-  return task.dependencies
+  const deps = task.dependencies
     .map((dependencyId) => tasks.find((candidate) => candidate.id === dependencyId))
-    .filter((dependency): dependency is TaskRecord => Boolean(dependency))
+    .filter((dependency): dependency is TaskRecord => Boolean(dependency));
+
+  if (deps.length === 0) return '';
+
+  return deps
     .map((dependency) => {
       const summary =
         dependency.outputSummary ||
@@ -310,7 +318,29 @@ function buildDependencyContext(task: TaskRecord, tasks: TaskRecord[]): string {
         dependency.commitMessage ||
         `Dependency finished with status ${dependency.status}.`;
 
-      return `- ${dependency.title}: ${summary}`;
+      const scopeHint = dependency.writeScope.length
+        ? `  Files in scope: ${dependency.writeScope.join(', ')}`
+        : '';
+      const commitHint = dependency.commitMessage
+        ? `  Commit: ${dependency.commitMessage}`
+        : '';
+
+      // Retrieve the diff artifact for this dependency to show which files were actually modified
+      let filesModified = '';
+      try {
+        const artifacts = unityStore.listArtifactsByRun(dependency.runId);
+        const diffArtifact = artifacts.find((a) => a.taskId === dependency.id && a.type === 'diff');
+        if (diffArtifact?.content) {
+          const changedFiles = extractChangedPaths(diffArtifact.content);
+          if (changedFiles.length > 0) {
+            filesModified = `\n  Files modified: ${changedFiles.join(', ')}`;
+          }
+        }
+      } catch {
+        // Artifact lookup failed — non-critical
+      }
+
+      return `- ${dependency.title}: ${summary}${scopeHint}${commitHint}${filesModified}`;
     })
     .join('\n');
 }
@@ -466,6 +496,29 @@ async function executeTask(
     startedAt: nowIso(),
   });
 
+  // Per-task timeout: combine run-level signal with task-level deadline
+  // TODO: Re-enable per-task timeout after testing — currently disabled to avoid premature aborts
+  const taskAbortController = new AbortController();
+  let taskTimer: ReturnType<typeof setTimeout> | undefined;
+  // const taskTimeoutMs = policy.maxMinutesPerTask > 0
+  //   ? policy.maxMinutesPerTask * 60 * 1000
+  //   : 0;
+  // if (taskTimeoutMs > 0) {
+  //   taskTimer = setTimeout(() => {
+  //     console.warn(`⏱️ Task "${task.title}" exceeded ${policy.maxMinutesPerTask} minute budget — aborting.`);
+  //     taskAbortController.abort(new Error(`Task timeout: exceeded ${policy.maxMinutesPerTask} minute budget`));
+  //   }, taskTimeoutMs);
+  // }
+  // Forward run-level abort to task-level controller
+  if (signal) {
+    if (signal.aborted) {
+      taskAbortController.abort(signal.reason);
+    } else {
+      signal.addEventListener('abort', () => taskAbortController.abort(signal.reason), { once: true });
+    }
+  }
+  const taskSignal = taskAbortController.signal;
+
   try {
     if (onProgress) {
       await onProgress(`🧪 [${task.title}] Running baseline scoped gates before editing...`);
@@ -499,7 +552,7 @@ async function executeTask(
         projectMemory,
         projectName: run.projectName,
         writeScope: task.writeScope,
-        signal,
+        signal: taskSignal,
         onProgress: onProgress ? (msg) => onProgress(`🤖 [${task.title}] ${msg}`) : undefined,
         runId: run.id,
         taskId: task.id,
@@ -518,6 +571,12 @@ async function executeTask(
       }
     }
 
+    // Build baseline failure context so the agent doesn't waste iterations on pre-existing errors
+    const failedBaselineGates = baselineStaticGates.filter((g) => g.status === 'failed');
+    const baselineFailures = failedBaselineGates.length > 0
+      ? failedBaselineGates.map((g) => `- ${g.name}: ${g.details.substring(0, 300)}`).join('\n')
+      : null;
+
     const execution = await generateAndWriteCode({
       repoPath: taskWorktree.workspace.repoPath,
       userPrompt: buildScopedTaskPrompt(task, run.prompt, dependencyContext, options),
@@ -527,7 +586,8 @@ async function executeTask(
       currentDiff: null,
       learnedPatterns: learningContext.promptSection || null,
       architectContext,
-      signal,
+      baselineFailures,
+      signal: taskSignal,
       runId: run.id,
       taskId: task.id,
       onStatusUpdate: (status, thought) => {
@@ -610,7 +670,7 @@ async function executeTask(
         taskId: task.id,
         runId: run.id,
         succeeded: status === 'succeeded',
-        iterations: 0, // Not tracked at this level
+        iterations: execution.iterations || 0,
         tokensUsed: execution.tokenUsage,
       });
     }
@@ -625,11 +685,11 @@ async function executeTask(
         taskKind: task.kind,
         taskPrompt: task.prompt,
         writeScope: task.writeScope,
-        iterations: 0, // Would need to track from agent-runner
+        iterations: execution.iterations || 0,
         tokensUsed: execution.tokenUsage,
-        filesRead: [], // Would need tool history from agent-runner
+        filesRead: execution.filesRead || [],
         filesEdited: extractEditedFiles(diff),
-        toolHistory: [],
+        toolHistory: execution.toolHistory || [],
         commitMessage: execution.commitMessage,
         gateResults: staticGates.map((g) => ({ name: g.name, status: g.status })),
       }).catch((err) => {
@@ -655,6 +715,7 @@ async function executeTask(
       },
     };
   } finally {
+    if (taskTimer) clearTimeout(taskTimer);
     await removeTaskWorktree(baseWorkspace.repoPath, taskWorktree.worktreePath);
   }
 }
@@ -683,7 +744,19 @@ async function integrateTaskResult(
     console.log(`🔧 Auto-resolved conflicts during integration of task commit: ${result.conflictFiles.join(', ')}`);
   }
 
-  await pushBranch(baseWorkspace.repoPath, run.branchName);
+  try {
+    await pushBranch(baseWorkspace.repoPath, run.branchName);
+  } catch (pushError) {
+    // Push failed (e.g. SSL timeout) — revert the cherry-pick to restore clean integration branch
+    // so the next retry attempt starts from a consistent state
+    console.warn(`⚠️ Push failed after cherry-pick, reverting to restore clean state: ${pushError instanceof Error ? pushError.message : String(pushError)}`);
+    try {
+      await execPromise('git reset --hard HEAD~1', { cwd: baseWorkspace.repoPath });
+    } catch (revertError) {
+      console.error('Failed to revert cherry-pick after push failure:', revertError);
+    }
+    throw pushError;
+  }
 }
 
 function createImprovementTasks(
@@ -1412,6 +1485,13 @@ export async function createAutonomousRunPlan({
   unityStore.upsertPolicy(project.name, policy);
 
   const baseWorkspace = await prepareWorkspace(project);
+
+  // Auto-populate knowledge graph on first run for a project
+  const kg = getKnowledgeGraph();
+  if (kg.listModules(project.name).length === 0) {
+    kg.scanProjectStructure(project.name, baseWorkspace.repoPath);
+  }
+
   const branchState = await ensureIntegrationBranch(baseWorkspace, policy.integrationBranchName);
   const baselineStaticResults = await runStaticGates(baseWorkspace, policy);
   const runId = createEntityId('run');
@@ -1638,6 +1718,13 @@ export async function resumeAutonomousRun({
   unityStore.upsertPolicy(project.name, policy);
 
   const baseWorkspace = await prepareWorkspace(project);
+
+  // Auto-populate knowledge graph on first run for a project
+  const kgResume = getKnowledgeGraph();
+  if (kgResume.listModules(project.name).length === 0) {
+    kgResume.scanProjectStructure(project.name, baseWorkspace.repoPath);
+  }
+
   await ensureIntegrationBranch(baseWorkspace, run.branchName);
   let baselineStaticResults = loadBaselineStaticResults(runId);
   if (baselineStaticResults.length === 0) {

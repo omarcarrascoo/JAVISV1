@@ -24,6 +24,8 @@ export interface AutonomousRunPolicy {
   maxTokensPerRun: number;
   /** Max tokens for a single task execution (0 = unlimited) */
   maxTokensPerTask: number;
+  /** Max minutes per task attempt (0 = unlimited). Prevents one task from consuming the run window. */
+  maxMinutesPerTask: number;
   gates: GatePolicy;
 }
 

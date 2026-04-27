@@ -6,6 +6,7 @@ import type { GateResult } from '../../domain/orchestration.js';
 import type { AutonomousRunPolicy } from '../../domain/policies.js';
 import type { PreparedWorkspace } from '../../domain/runtime.js';
 import { runProjectRuntimeGate } from './runtime-gate.js';
+import { buildImportGraph as buildImportGraphShared, type ImportGraph } from '../../shared/import-graph.js';
 
 const execPromise = util.promisify(exec);
 
@@ -31,101 +32,6 @@ const SECRET_ALLOWLIST = [
 ];
 
 /* ── Import Cycle Detection ── */
-
-type ImportGraph = Map<string, Set<string>>;
-
-function buildImportGraph(repoPath: string, scopes: string[]): ImportGraph {
-  const graph: ImportGraph = new Map();
-  const normalizedScopes = normalizeScopes(scopes);
-  const sourceExtensions = ['.ts', '.tsx', '.js', '.jsx'];
-
-  function walkDir(dir: string): string[] {
-    const files: string[] = [];
-    if (!fs.existsSync(dir)) return files;
-
-    try {
-      const entries = fs.readdirSync(dir, { withFileTypes: true });
-      for (const entry of entries) {
-        if (entry.name === 'node_modules' || entry.name === '.git' || entry.name === 'dist') continue;
-        const fullPath = path.join(dir, entry.name);
-        if (entry.isDirectory()) {
-          files.push(...walkDir(fullPath));
-        } else if (sourceExtensions.some((ext) => entry.name.endsWith(ext))) {
-          files.push(fullPath);
-        }
-      }
-    } catch {
-      // Permission or read errors — skip
-    }
-    return files;
-  }
-
-  // Collect files in scope
-  const scopeDirs = normalizedScopes.includes('.')
-    ? [repoPath]
-    : normalizedScopes.map((s) => path.join(repoPath, s));
-
-  const allFiles: string[] = [];
-  for (const dir of scopeDirs) {
-    allFiles.push(...walkDir(dir));
-  }
-
-  // Parse imports (simple regex — covers 95% of cases)
-  const importPattern = /(?:import|export)\s+.*?from\s+['"]([^'"]+)['"]/g;
-  const requirePattern = /require\s*\(\s*['"]([^'"]+)['"]\s*\)/g;
-
-  for (const file of allFiles) {
-    const relFile = path.relative(repoPath, file);
-    const deps = new Set<string>();
-
-    try {
-      const content = fs.readFileSync(file, 'utf8');
-      for (const pattern of [importPattern, requirePattern]) {
-        pattern.lastIndex = 0;
-        let match;
-        while ((match = pattern.exec(content)) !== null) {
-          const specifier = match[1];
-          // Only track relative imports (not node_modules)
-          if (!specifier.startsWith('.')) continue;
-
-          const resolved = resolveImportPath(file, specifier, sourceExtensions);
-          if (resolved) {
-            deps.add(path.relative(repoPath, resolved));
-          }
-        }
-      }
-    } catch {
-      // Unreadable file
-    }
-
-    graph.set(relFile, deps);
-  }
-
-  return graph;
-}
-
-function resolveImportPath(fromFile: string, specifier: string, extensions: string[]): string | null {
-  const dir = path.dirname(fromFile);
-  const base = path.resolve(dir, specifier);
-
-  // Direct file match
-  for (const ext of ['', ...extensions]) {
-    const candidate = base + ext;
-    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
-      return candidate;
-    }
-  }
-
-  // Index file in directory
-  for (const ext of extensions) {
-    const candidate = path.join(base, `index${ext}`);
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  return null;
-}
 
 function findCycles(graph: ImportGraph): string[][] {
   const cycles: string[][] = [];
@@ -342,7 +248,7 @@ function runSecurityScanGate(repoPath: string, scopes: string[]): GateResult {
 /* ── Import Cycle Gate ── */
 
 function runImportCycleGate(repoPath: string, scopes: string[]): GateResult {
-  const graph = buildImportGraph(repoPath, scopes);
+  const graph = buildImportGraphShared(repoPath, normalizeScopes(scopes));
   const cycles = findCycles(graph);
 
   if (cycles.length === 0) {

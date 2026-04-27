@@ -25,6 +25,8 @@ export interface BuildSystemPromptParams {
   learnedPatterns?: string | null;
   /** Pre-computed context from the Explorer→Architect pipeline */
   architectContext?: string | null;
+  /** Summary of pre-existing gate failures so the agent doesn't try to fix them */
+  baselineFailures?: string | null;
 }
 
 export interface GenerateCodeParams extends BuildSystemPromptParams {
