@@ -7,19 +7,14 @@ import {
   runTypecheckForDirs,
 } from './validation-service.js';
 import {
-  countBroadExplorationCalls,
-  hasEnoughTargetEvidence,
+  evaluateLoopControl,
   isFatalRuntimeError,
   isFatalToolError,
 } from './loop-heuristics.js';
-import { createDeepseekChatCompletion } from './client.js';
+import { roleCompletion } from './completion.js';
+import { telemetry } from '../telemetry/index.js';
+import type { LLMMessage } from './providers/types.js';
 import type { AIResponse, GenerateCodeParams } from './types.js';
-
-function isFunctionToolCall(
-  toolCall: any,
-): toolCall is { id: string; function: { name: string; arguments?: string } } {
-  return Boolean(toolCall && typeof toolCall.id === 'string' && toolCall.function);
-}
 
 export async function generateAndWriteCode({
   repoPath,
@@ -30,9 +25,13 @@ export async function generateAndWriteCode({
   currentDiff,
   onStatusUpdate,
   signal,
-}: GenerateCodeParams): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number }> {
+  runId,
+  taskId,
+  learnedPatterns,
+  architectContext,
+}: GenerateCodeParams): Promise<{ targetRoute: string; commitMessage: string; tokenUsage: number; iterations: number; toolHistory: string[]; filesRead: string[] }> {
   const toolRuntime = createAgentToolRuntime(repoPath);
-  const messages: any[] = [
+  const messages: LLMMessage[] = [
     {
       role: 'system',
       content: buildSystemPrompt({
@@ -41,6 +40,8 @@ export async function generateAndWriteCode({
         projectTree,
         projectMemory,
         currentDiff,
+        learnedPatterns,
+        architectContext,
       }),
     },
     { role: 'user', content: userPrompt },
@@ -50,87 +51,125 @@ export async function generateAndWriteCode({
   const maxLoops = 100;
   let totalTokens = 0;
   const toolHistory: string[] = [];
+  const filesReadSet = new Set<string>();
+  let consecutiveRedirects = 0;
+  let finalLoop = 0;
 
   for (let loop = 1; loop <= maxLoops; loop++) {
+    finalLoop = loop;
     if (signal?.aborted) throw new Error('AbortError');
 
     const statusMsg = `🔄 Iteration ${loop}... Thinking...`;
     if (onStatusUpdate) onStatusUpdate(statusMsg);
 
-    const response = await createDeepseekChatCompletion(
-      {
-        model: 'deepseek-reasoner',
-        messages,
-        tools: toolRuntime.tools as any,
-        temperature: 0.1,
-        max_tokens: 8192,
-      },
-      { signal },
-    );
+    // After 3+ consecutive redirects, strip tools to force JSON output
+    const enforceJsonOnly = consecutiveRedirects >= 3;
+    const response = await roleCompletion('code-gen', {
+      messages,
+      tools: enforceJsonOnly ? undefined : (toolRuntime.tools as any),
+      signal,
+      runId,
+      taskId,
+    });
 
-    if (response.usage) {
-      totalTokens += response.usage.total_tokens;
-    }
+    totalTokens += response.usage.totalTokens;
 
-    const message = response.choices?.[0]?.message;
-    if (!message) throw new Error('Model returned an empty response.');
+    const agentContent = response.content?.trim() || '';
+    const agentToolCalls = response.toolCalls;
 
-    messages.push(message);
+    // Reconstruct assistant message for conversation history
+    const assistantMessage: LLMMessage = {
+      role: 'assistant',
+      content: agentContent,
+      ...(agentToolCalls.length ? { tool_calls: agentToolCalls } : {}),
+    };
+    messages.push(assistantMessage);
 
-    const agentThought = message.content ? message.content.trim() : '';
+    const agentThought = agentContent;
 
-    if (message.tool_calls?.length) {
-      const broadExplorationCount = countBroadExplorationCalls(toolHistory);
-      const enoughEvidence = hasEnoughTargetEvidence(toolHistory);
+    if (agentToolCalls.length) {
+      // Record tool descriptors BEFORE evaluating loop control so heuristics
+      // see the current iteration's tools (fixes off-by-1 spiral detection)
+      for (const tc of agentToolCalls) {
+        try {
+          const args = JSON.parse(tc.function.arguments || '{}');
+          const primaryArg = args.filepath || args.keyword || args.pattern || args.symbol || args.cmd || args.path || '';
+          toolHistory.push(`${tc.function.name}:${primaryArg}`);
+        } catch {
+          toolHistory.push(`${tc.function.name}:`);
+        }
+      }
 
-      if (broadExplorationCount >= 3 && enoughEvidence) {
+      const loopControl = evaluateLoopControl(toolHistory, loop, totalTokens);
+
+      if (loopControl.shouldRedirect) {
+        consecutiveRedirects++;
+
+        // Must respond to every tool_call before adding a user message
+        for (const tc of agentToolCalls) {
+          messages.push({
+            role: 'tool',
+            tool_call_id: tc.id,
+            name: tc.function.name,
+            content: '[Skipped — redirecting to implementation]',
+          });
+        }
+
+        const escalation = consecutiveRedirects >= 3
+          ? `\n\n🛑 HARD REDIRECT (${consecutiveRedirects} consecutive redirects): Tools have been DISABLED. You MUST respond with ONLY a JSON object containing your implementation (edits, targetRoute, commitMessage). No tool calls will be accepted.`
+          : '';
+
         messages.push({
           role: 'user',
-          content: `You already have enough context to implement the smallest requested change.
-Stop broad exploration and produce the patch for the minimal valid implementation.
-Do not expand the scope unless a concrete blocker remains.`,
+          content: loopControl.reason + escalation,
         });
 
         if (onStatusUpdate) {
-          onStatusUpdate('⚠️ Jarvis had enough evidence and was redirected to implementation.');
+          onStatusUpdate(
+            consecutiveRedirects >= 3
+              ? `🛑 Hard redirect enforced — tools stripped (redirect #${consecutiveRedirects}).`
+              : '⚠️ Jarvis was redirected to implementation.',
+          );
+        }
+
+        // Emit telemetry for redirect spirals (every redirect after the first)
+        if (runId && taskId && consecutiveRedirects >= 2) {
+          telemetry.redirectSpiral({
+            runId,
+            taskId,
+            projectName: '',
+            consecutiveRedirects,
+            iterationCount: loop,
+            toolsStripped: consecutiveRedirects >= 3,
+          });
         }
 
         continue;
       }
 
-      for (const toolCall of message.tool_calls) {
-        if (!isFunctionToolCall(toolCall)) {
-          messages.push({
-            role: 'tool',
-            tool_call_id: toolCall.id,
-            content: 'Tool error: Unsupported non-function tool call.',
-          });
-          continue;
-        }
+      // Agent is making productive tool calls — reset redirect counter
+      consecutiveRedirects = 0;
 
+      for (const toolCall of agentToolCalls) {
         const functionName = toolCall.function.name;
         let toolResult = '';
 
         try {
           const args = JSON.parse(toolCall.function.arguments || '{}');
-          const toolDescriptor = `${functionName}:${args.filepath || args.keyword || args.cmd || ''}`;
-          toolHistory.push(toolDescriptor);
+          const primaryArg = args.filepath || args.keyword || args.pattern || args.symbol || args.cmd || args.path || '';
 
           if (onStatusUpdate) {
             onStatusUpdate(
-              `🛠️ Executing: ${functionName} -> ${args.filepath || args.keyword || args.cmd}`,
+              `🛠️ Executing: ${functionName} -> ${primaryArg}`,
               agentThought,
             );
           }
 
-          if (functionName === 'read_file') {
-            toolResult = toolRuntime.readFile(args.filepath, args.startLine, args.endLine);
-          } else if (functionName === 'search_project') {
-            toolResult = toolRuntime.searchProject(args.keyword, args.maxResults);
-          } else if (functionName === 'run_command') {
-            toolResult = await toolRuntime.runCommand(args.cmd);
-          } else {
-            toolResult = `Tool error: Unsupported tool "${functionName}"`;
+          toolResult = await toolRuntime.executeTool(functionName, args);
+
+          // Track file reads explicitly for learning patterns
+          if (functionName === 'read_file' && args.filepath) {
+            filesReadSet.add(args.filepath);
           }
 
           if (isFatalToolError(toolResult)) {
@@ -156,7 +195,7 @@ Do not expand the scope unless a concrete blocker remains.`,
     }
 
     try {
-      finalResult = parseJsonObject<AIResponse>(message.content || '');
+      finalResult = parseJsonObject<AIResponse>(agentContent);
 
       if (agentThought && onStatusUpdate) {
         onStatusUpdate('🧪 Validating syntax and compilation...', agentThought);
@@ -298,5 +337,8 @@ Re-check that your JSON accurately matches the code changes you made and return 
     targetRoute: finalResult.targetRoute || '/',
     commitMessage: finalResult.commitMessage || 'feat: auto-update',
     tokenUsage: totalTokens,
+    iterations: finalLoop,
+    toolHistory,
+    filesRead: Array.from(filesReadSet),
   };
 }

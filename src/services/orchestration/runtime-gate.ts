@@ -1,14 +1,17 @@
 import fs from 'fs';
-import os from 'os';
 import path from 'path';
 import { ChildProcess, exec, spawn } from 'child_process';
 import util from 'util';
 import type { PreparedWorkspace } from '../../domain/runtime.js';
+import {
+  resolveRuntimeManifest,
+  getLocalIpAddress,
+  type RuntimeServiceConfig,
+} from './runtime-gate-config.js';
 
 const execPromise = util.promisify(exec);
 
-let currentExpoProcess: ChildProcess | null = null;
-let currentNestProcess: ChildProcess | null = null;
+const activeProcesses: ChildProcess[] = [];
 
 export interface RuntimeGateResult {
   localUrl: string | null;
@@ -19,87 +22,12 @@ export interface RuntimeGateResult {
 
 type RuntimeLogFn = (message: string) => Promise<void> | void;
 
-function getLocalIpAddress(): string | null {
-  const interfaces = os.networkInterfaces();
-
-  for (const name of Object.keys(interfaces)) {
-    for (const iface of interfaces[name] || []) {
-      if (iface.family === 'IPv4' && !iface.internal) {
-        return iface.address;
-      }
-    }
-  }
-
-  return null;
-}
-
-function injectApiUrlToEnv(expoPath: string, url: string) {
-  const envPath = path.join(expoPath, '.env');
-  let envContent = '';
-
-  if (fs.existsSync(envPath)) {
-    envContent = fs.readFileSync(envPath, 'utf8');
-  }
-
-  envContent = envContent.replace(/^EXPO_PUBLIC_API_URL=.*$/gm, '').trim();
-  envContent += `\nEXPO_PUBLIC_API_URL=${url}\n`;
-  fs.writeFileSync(envPath, envContent.trim() + '\n');
-}
-
-function hasExpoApp(expoPath: string): boolean {
-  const packageJsonPath = path.join(expoPath, 'package.json');
-
-  if (!fs.existsSync(packageJsonPath)) {
-    return false;
-  }
-
-  const pkg = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
-  return Boolean(pkg.dependencies?.expo || pkg.devDependencies?.expo);
-}
-
-function hasNodeModules(packageDir: string | null): boolean {
-  if (!packageDir) {
-    return false;
-  }
-
-  try {
-    return fs.statSync(path.join(packageDir, 'node_modules')).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
-function getPackageManagerHint(packageDir: string | null): string {
-  if (!packageDir) {
-    return 'none';
-  }
-
-  if (fs.existsSync(path.join(packageDir, 'package-lock.json'))) {
-    return 'npm';
-  }
-
-  if (fs.existsSync(path.join(packageDir, 'yarn.lock'))) {
-    return 'yarn';
-  }
-
-  if (fs.existsSync(path.join(packageDir, 'pnpm-lock.yaml'))) {
-    return 'pnpm';
-  }
-
-  return 'npm';
-}
-
 async function emitRuntimeLog(onLog: RuntimeLogFn | undefined, message: string): Promise<void> {
-  if (!onLog) {
-    return;
-  }
-
-  await onLog(message);
+  if (onLog) await onLog(message);
 }
 
 function killTrackedProcess(proc: ChildProcess | null): void {
   if (!proc?.pid) return;
-
   try {
     proc.kill('SIGKILL');
   } catch {
@@ -111,100 +39,142 @@ async function killPort(port: number): Promise<void> {
   await execPromise(`fuser -k ${port}/tcp || true`).catch(() => {});
 }
 
+function cleanupActiveProcesses(): void {
+  for (const proc of activeProcesses) {
+    killTrackedProcess(proc);
+  }
+  activeProcesses.length = 0;
+}
+
+function hasNodeModules(dir: string): boolean {
+  try {
+    return fs.statSync(path.join(dir, 'node_modules')).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+function getPackageManagerHint(dir: string): string {
+  if (fs.existsSync(path.join(dir, 'package-lock.json'))) return 'npm';
+  if (fs.existsSync(path.join(dir, 'yarn.lock'))) return 'yarn';
+  if (fs.existsSync(path.join(dir, 'pnpm-lock.yaml'))) return 'pnpm';
+  return 'npm';
+}
+
+function injectEnvVar(dir: string, key: string, value: string): void {
+  const envPath = path.join(dir, '.env');
+  let content = '';
+  if (fs.existsSync(envPath)) {
+    content = fs.readFileSync(envPath, 'utf8');
+  }
+  const pattern = new RegExp(`^${key}=.*$`, 'gm');
+  content = content.replace(pattern, '').trim();
+  content += `\n${key}=${value}\n`;
+  fs.writeFileSync(envPath, content.trim() + '\n');
+}
+
+/**
+ * Start a single service and wait for its readySignal.
+ * Returns the spawned process or null on failure.
+ */
+async function startService(
+  service: RuntimeServiceConfig,
+  onLog?: RuntimeLogFn,
+): Promise<{ proc: ChildProcess; log: string } | { error: string }> {
+  // Pre-flight: check node_modules
+  if (service.requiresNodeModules && !hasNodeModules(service.cwd)) {
+    const details = `${service.name} prerequisites missing: node_modules not found in ${service.cwd}. Expected: ${getPackageManagerHint(service.cwd)}.`;
+    await emitRuntimeLog(onLog, `❌ [runtime:${service.name}] ${details}`);
+    return { error: details };
+  }
+
+  // Kill existing port occupants
+  await killPort(service.port);
+
+  const [cmd, ...args] = service.startCommand.split(' ');
+  await emitRuntimeLog(onLog, `🌐 [runtime:${service.name}] Starting \`${service.startCommand}\` in ${service.cwd}`);
+
+  const env = { ...process.env, ...service.env };
+  const proc = spawn(cmd, args, { cwd: service.cwd, stdio: 'pipe', env });
+  activeProcesses.push(proc);
+
+  let serviceLog = '';
+  const onOutput = (data: Buffer | string) => {
+    serviceLog += data.toString();
+  };
+  proc.stdout?.on('data', onOutput);
+  proc.stderr?.on('data', onOutput);
+
+  // Wait for ready signal or timeout
+  const ready = await new Promise<boolean>((resolve) => {
+    let resolved = false;
+
+    const checkReady = () => {
+      if (resolved) return;
+      if (serviceLog.includes(service.readySignal)) {
+        resolved = true;
+        resolve(true);
+      }
+    };
+
+    proc.stdout?.on('data', checkReady);
+    proc.stderr?.on('data', checkReady);
+
+    proc.on('exit', () => {
+      if (!resolved) {
+        resolved = true;
+        resolve(false);
+      }
+    });
+
+    setTimeout(() => {
+      if (!resolved) {
+        resolved = true;
+        resolve(false);
+      }
+    }, service.timeoutMs);
+
+    // Also check what we've already accumulated
+    checkReady();
+  });
+
+  if (!ready) {
+    const exitCode = proc.exitCode;
+    const trimmedLog = serviceLog.trim().slice(0, 1000);
+
+    if (exitCode !== null) {
+      const details = `${service.name} exited before ready. Exit code: ${exitCode}. Logs: ${trimmedLog}`;
+      await emitRuntimeLog(onLog, `❌ [runtime:${service.name}] ${details}`);
+      return { error: details };
+    }
+
+    const details = `${service.name} failed to emit ready signal within ${service.timeoutMs}ms.${trimmedLog ? ` Logs: ${trimmedLog}` : ''}`;
+    await emitRuntimeLog(onLog, `❌ [runtime:${service.name}] ${details}`);
+    return { error: details };
+  }
+
+  await emitRuntimeLog(onLog, `✅ [runtime:${service.name}] Ready on port ${service.port}.`);
+  return { proc, log: serviceLog };
+}
+
+/**
+ * Run the config-driven runtime gate.
+ *
+ * Starts all services defined in the manifest (backends first, frontends second),
+ * links backend URL to frontend if configured, and reports overall health.
+ */
 export async function runProjectRuntimeGate(
   workspace: PreparedWorkspace,
   targetRoute = '/',
   onLog?: RuntimeLogFn,
 ): Promise<RuntimeGateResult> {
-  const expoAvailable = hasExpoApp(workspace.expoPath);
-  const expoNodeModules = hasNodeModules(workspace.expoPath);
-  const apiNodeModules = hasNodeModules(workspace.apiPath);
-  const port = 8081;
-  const backendPort = 3000;
-  const localUrl = `http://localhost:${port}${targetRoute.startsWith('/') ? targetRoute : `/${targetRoute}`}`;
-  const ip = getLocalIpAddress();
-  const publicUrl = ip ? `http://${ip}:${port}${targetRoute.startsWith('/') ? targetRoute : `/${targetRoute}`}` : null;
+  // Cleanup any previous runtime processes
+  cleanupActiveProcesses();
 
-  await emitRuntimeLog(
-    onLog,
-    `🌐 [runtime] Preflight: route=${targetRoute}, expo=${expoAvailable ? workspace.expoPath : 'not detected'}, api=${
-      workspace.apiPath || 'not detected'
-    }, expo node_modules=${expoNodeModules ? 'present' : 'missing'}, api node_modules=${
-      workspace.apiPath ? (apiNodeModules ? 'present' : 'missing') : 'n/a'
-    }.`,
-  );
+  const manifest = resolveRuntimeManifest(workspace.repoPath, workspace.expoPath, workspace.apiPath);
 
-  killTrackedProcess(currentExpoProcess);
-  killTrackedProcess(currentNestProcess);
-  currentExpoProcess = null;
-  currentNestProcess = null;
-
-  await emitRuntimeLog(onLog, `🌐 [runtime] Clearing ports ${backendPort} and ${port} before boot.`);
-  await killPort(port);
-  await killPort(backendPort);
-  await new Promise((resolve) => setTimeout(resolve, 1000));
-
-  if (workspace.apiPath) {
-    if (!apiNodeModules) {
-      const details = `API runtime prerequisites missing: node_modules not found in ${workspace.apiPath}. Expected package manager: ${getPackageManagerHint(
-        workspace.apiPath,
-      )}.`;
-      await emitRuntimeLog(onLog, `❌ [runtime] ${details}`);
-      return {
-        localUrl: null,
-        publicUrl: null,
-        details,
-        status: 'failed',
-      };
-    }
-
-    await emitRuntimeLog(onLog, `🌐 [runtime] Starting backend with \`npm run start\` in ${workspace.apiPath}.`);
-    currentNestProcess = spawn('npm', ['run', 'start'], {
-      cwd: workspace.apiPath,
-      stdio: 'pipe',
-    });
-
-    let backendLog = '';
-    const onBackendOutput = (data: Buffer | string) => {
-      backendLog += data.toString();
-    };
-    currentNestProcess.stdout?.on('data', onBackendOutput);
-    currentNestProcess.stderr?.on('data', onBackendOutput);
-
-    const backendUrl = ip ? `http://${ip}:${backendPort}` : `http://localhost:${backendPort}`;
-    if (expoAvailable) {
-      injectApiUrlToEnv(workspace.expoPath, backendUrl);
-      await emitRuntimeLog(onLog, `🌐 [runtime] Injected EXPO_PUBLIC_API_URL=${backendUrl} into ${workspace.expoPath}/.env.`);
-    }
-    await new Promise((resolve) => setTimeout(resolve, 3000));
-
-    if (currentNestProcess.exitCode !== null) {
-      const details = `Backend exited before runtime verification. Exit code: ${currentNestProcess.exitCode}. Logs: ${backendLog
-        .trim()
-        .slice(0, 1000)}`;
-      await emitRuntimeLog(onLog, `❌ [runtime] ${details}`);
-      return {
-        localUrl: null,
-        publicUrl: null,
-        details,
-        status: 'failed',
-      };
-    }
-
-    await emitRuntimeLog(onLog, `🌐 [runtime] Backend boot window elapsed without early exit.`);
-  }
-
-  if (!expoAvailable) {
-    if (workspace.apiPath) {
-      await emitRuntimeLog(onLog, `✅ [runtime] Expo app not detected. API-only runtime considered healthy.`);
-      return {
-        localUrl: `http://localhost:${backendPort}`,
-        publicUrl: ip ? `http://${ip}:${backendPort}` : null,
-        details: `API runtime available at http://localhost:${backendPort}`,
-        status: 'passed',
-      };
-    }
-
+  if (manifest.services.length === 0) {
+    await emitRuntimeLog(onLog, `🌐 [runtime] No runtime services detected. Skipping.`);
     return {
       localUrl: null,
       publicUrl: null,
@@ -213,97 +183,70 @@ export async function runProjectRuntimeGate(
     };
   }
 
-  if (!expoNodeModules) {
-    const details = `Expo runtime prerequisites missing: node_modules not found in ${workspace.expoPath}. Expected package manager: ${getPackageManagerHint(
-      workspace.expoPath,
-    )}.`;
-    await emitRuntimeLog(onLog, `❌ [runtime] ${details}`);
-    return {
-      localUrl: null,
-      publicUrl: null,
-      details,
-      status: 'failed',
-    };
+  const ip = getLocalIpAddress();
+
+  // Sort: backends first, then frontends, then generic
+  const sorted = [...manifest.services].sort((a, b) => {
+    const order = { backend: 0, generic: 1, frontend: 2 };
+    return (order[a.type] ?? 1) - (order[b.type] ?? 1);
+  });
+
+  await emitRuntimeLog(
+    onLog,
+    `🌐 [runtime] Preflight: ${sorted.length} service(s) to start: ${sorted.map((s) => `${s.name}(${s.type}:${s.port})`).join(', ')}`,
+  );
+
+  // Clear all ports
+  for (const service of sorted) {
+    await killPort(service.port);
   }
+  await new Promise((resolve) => setTimeout(resolve, 500));
 
-  return new Promise((resolve) => {
-    emitRuntimeLog(
-      onLog,
-      `🌐 [runtime] Starting Expo web with \`npx expo start --web --port ${port}\` in ${workspace.expoPath}.`,
-    ).catch(() => {});
+  let backendUrl: string | null = null;
 
-    currentExpoProcess = spawn('npx', ['expo', 'start', '--web', '--port', port.toString()], {
-      cwd: workspace.expoPath,
-      stdio: 'pipe',
-    });
+  for (const service of sorted) {
+    // If linking is enabled and this is a frontend, inject backend URL
+    if (
+      manifest.linkBackendToFrontend &&
+      service.type === 'frontend' &&
+      backendUrl
+    ) {
+      injectEnvVar(service.cwd, manifest.backendUrlEnvVar, backendUrl);
+      await emitRuntimeLog(onLog, `🌐 [runtime] Injected ${manifest.backendUrlEnvVar}=${backendUrl} into ${service.cwd}/.env`);
+    }
 
-    let ready = false;
-    let runtimeLog = '';
+    const result = await startService(service, onLog);
 
-    const processOutput = (data: any) => {
-      const text = data.toString();
-      runtimeLog += text;
-
-      if (
-        text.includes('http://localhost') ||
-        text.includes('Web is waiting on') ||
-        text.includes('ready in')
-      ) {
-        ready = true;
-      }
-    };
-
-    currentExpoProcess.stdout?.on('data', processOutput);
-    currentExpoProcess.stderr?.on('data', processOutput);
-    currentExpoProcess.on('exit', (code, signal) => {
-      if (!ready) {
-        emitRuntimeLog(
-          onLog,
-          `❌ [runtime] Expo exited before readiness. code=${code ?? 'null'} signal=${signal ?? 'null'}.`,
-        ).catch(() => {});
-      }
-    });
-
-    const interval = setInterval(() => {
-      if (!ready) {
-        return;
-      }
-
-      clearInterval(interval);
-      emitRuntimeLog(onLog, `✅ [runtime] Expo reported ready at ${localUrl}.`).catch(() => {});
-      resolve({
-        localUrl,
-        publicUrl,
-        details: `Runtime available at ${localUrl}`,
-        status: 'passed',
-      });
-    }, 1000);
-
-    setTimeout(() => {
-      clearInterval(interval);
-
-      if (ready) {
-        emitRuntimeLog(onLog, `✅ [runtime] Expo reported ready at ${localUrl}.`).catch(() => {});
-        resolve({
-          localUrl,
-          publicUrl,
-          details: `Runtime available at ${localUrl}`,
-          status: 'passed',
-        });
-        return;
-      }
-
-      const trimmedLog = runtimeLog.trim().slice(0, 1000);
-      emitRuntimeLog(
-        onLog,
-        `❌ [runtime] Runtime failed to start within 30s.${trimmedLog ? ` Logs: ${trimmedLog}` : ''}`,
-      ).catch(() => {});
-      resolve({
+    if ('error' in result) {
+      return {
         localUrl: null,
         publicUrl: null,
-        details: `Runtime failed to start within 30s.${trimmedLog ? ` Logs: ${trimmedLog}` : ''}`,
+        details: result.error,
         status: 'failed',
-      });
-    }, 30000);
-  });
+      };
+    }
+
+    // Track backend URL for frontend injection
+    if (service.type === 'backend') {
+      backendUrl = ip ? `http://${ip}:${service.port}` : `http://localhost:${service.port}`;
+    }
+  }
+
+  // Find the "primary" service for URL reporting (prefer frontend, fallback to first)
+  const primary =
+    sorted.find((s) => s.type === 'frontend') ||
+    sorted[0];
+
+  const route = targetRoute.startsWith('/') ? targetRoute : `/${targetRoute}`;
+  const localUrl = `http://localhost:${primary.port}${route}`;
+  const publicUrl = ip ? `http://${ip}:${primary.port}${route}` : null;
+
+  await emitRuntimeLog(onLog, `✅ [runtime] All ${sorted.length} service(s) healthy. Primary: ${localUrl}`);
+
+  return {
+    localUrl,
+    publicUrl,
+    details: `Runtime available at ${localUrl}. Services: ${sorted.map((s) => s.name).join(', ')}.`,
+    status: 'passed',
+  };
 }

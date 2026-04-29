@@ -6,6 +6,10 @@ export interface GatePolicy {
   runRuntime: boolean;
   requireRuntimeForUi: boolean;
   captureSnapshot: boolean;
+  /** Scan for hardcoded secrets/credentials in scope */
+  runSecurityScan: boolean;
+  /** Detect circular import chains in scope */
+  runImportCycleCheck: boolean;
 }
 
 export interface AutonomousRunPolicy {
@@ -16,6 +20,12 @@ export interface AutonomousRunPolicy {
   maxImprovementCycles: number;
   maxHours: number;
   maxCommits: number;
+  /** Max tokens across all tasks in a single run (0 = unlimited) */
+  maxTokensPerRun: number;
+  /** Max tokens for a single task execution (0 = unlimited) */
+  maxTokensPerTask: number;
+  /** Max minutes per task attempt (0 = unlimited). Prevents one task from consuming the run window. */
+  maxMinutesPerTask: number;
   gates: GatePolicy;
 }
 

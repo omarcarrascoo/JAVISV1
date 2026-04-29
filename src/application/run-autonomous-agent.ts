@@ -1,5 +1,9 @@
 import path from 'path';
+import { exec } from 'child_process';
+import util from 'util';
 import { getRuntimeConfig, getProjectByName } from '../config.js';
+
+const execPromise = util.promisify(exec);
 import { getFigmaContext } from '../figma.js';
 import { prepareWorkspace } from '../git.js';
 import { getProjectMemory, getProjectTree } from '../scanner.js';
@@ -31,6 +35,9 @@ import { planAutonomousRun } from '../services/orchestration/planner.js';
 import { getProjectPolicy } from '../services/orchestration/policy-engine.js';
 import { reviewTaskResult } from '../services/orchestration/reviewer.js';
 import { createTaskWorktree, removeTaskWorktree } from '../services/orchestration/worktree-manager.js';
+import { buildLearningContext, extractPattern, recordPatternOutcomes } from '../services/learning/index.js';
+import { runAgentPipeline } from '../services/ai/agent-roles.js';
+import { getKnowledgeGraph } from '../services/knowledge/index.js';
 
 interface RunAutonomousAgentParams {
   project: WorkspaceProject;
@@ -244,6 +251,18 @@ function getOutOfScopePaths(workspace: PreparedWorkspace, diff: string, scopes: 
   });
 }
 
+function extractEditedFiles(diff: string): string[] {
+  return Array.from(
+    new Set(
+      diff
+        .split('\n')
+        .filter((line) => line.startsWith('+++ b/'))
+        .map((line) => line.replace('+++ b/', '').trim())
+        .filter((filePath) => filePath && filePath !== '/dev/null'),
+    ),
+  );
+}
+
 function buildScopedTaskPrompt(
   task: TaskRecord,
   runPrompt: string,
@@ -285,9 +304,13 @@ ${task.prompt}`;
 }
 
 function buildDependencyContext(task: TaskRecord, tasks: TaskRecord[]): string {
-  return task.dependencies
+  const deps = task.dependencies
     .map((dependencyId) => tasks.find((candidate) => candidate.id === dependencyId))
-    .filter((dependency): dependency is TaskRecord => Boolean(dependency))
+    .filter((dependency): dependency is TaskRecord => Boolean(dependency));
+
+  if (deps.length === 0) return '';
+
+  return deps
     .map((dependency) => {
       const summary =
         dependency.outputSummary ||
@@ -295,7 +318,29 @@ function buildDependencyContext(task: TaskRecord, tasks: TaskRecord[]): string {
         dependency.commitMessage ||
         `Dependency finished with status ${dependency.status}.`;
 
-      return `- ${dependency.title}: ${summary}`;
+      const scopeHint = dependency.writeScope.length
+        ? `  Files in scope: ${dependency.writeScope.join(', ')}`
+        : '';
+      const commitHint = dependency.commitMessage
+        ? `  Commit: ${dependency.commitMessage}`
+        : '';
+
+      // Retrieve the diff artifact for this dependency to show which files were actually modified
+      let filesModified = '';
+      try {
+        const artifacts = unityStore.listArtifactsByRun(dependency.runId);
+        const diffArtifact = artifacts.find((a) => a.taskId === dependency.id && a.type === 'diff');
+        if (diffArtifact?.content) {
+          const changedFiles = extractChangedPaths(diffArtifact.content);
+          if (changedFiles.length > 0) {
+            filesModified = `\n  Files modified: ${changedFiles.join(', ')}`;
+          }
+        }
+      } catch {
+        // Artifact lookup failed — non-critical
+      }
+
+      return `- ${dependency.title}: ${summary}${scopeHint}${commitHint}${filesModified}`;
     })
     .join('\n');
 }
@@ -442,7 +487,7 @@ async function executeTask(
   options?: { inClosingWindow?: boolean; remainingMs?: number },
   onProgress?: (message: string) => Promise<void>,
 ): Promise<ExecutedTaskResult> {
-  const taskWorktree = await createTaskWorktree(baseWorkspace, run.id, task.id, run.branchName);
+  const taskWorktree = await createTaskWorktree(baseWorkspace, run.id, task.id, run.branchName, task.writeScope);
   unityStore.updateTask(task.id, {
     status: 'running',
     attempts: task.attempts + 1,
@@ -451,12 +496,87 @@ async function executeTask(
     startedAt: nowIso(),
   });
 
+  // Per-task timeout: combine run-level signal with task-level deadline
+  // TODO: Re-enable per-task timeout after testing — currently disabled to avoid premature aborts
+  const taskAbortController = new AbortController();
+  let taskTimer: ReturnType<typeof setTimeout> | undefined;
+  // const taskTimeoutMs = policy.maxMinutesPerTask > 0
+  //   ? policy.maxMinutesPerTask * 60 * 1000
+  //   : 0;
+  // if (taskTimeoutMs > 0) {
+  //   taskTimer = setTimeout(() => {
+  //     console.warn(`⏱️ Task "${task.title}" exceeded ${policy.maxMinutesPerTask} minute budget — aborting.`);
+  //     taskAbortController.abort(new Error(`Task timeout: exceeded ${policy.maxMinutesPerTask} minute budget`));
+  //   }, taskTimeoutMs);
+  // }
+  // Forward run-level abort to task-level controller
+  if (signal) {
+    if (signal.aborted) {
+      taskAbortController.abort(signal.reason);
+    } else {
+      signal.addEventListener('abort', () => taskAbortController.abort(signal.reason), { once: true });
+    }
+  }
+  const taskSignal = taskAbortController.signal;
+
   try {
     if (onProgress) {
       await onProgress(`🧪 [${task.title}] Running baseline scoped gates before editing...`);
     }
     const baselineStaticGates = await runStaticGates(taskWorktree.workspace, policy, task.writeScope);
     const projectTree = getProjectTree(taskWorktree.workspace.repoPath);
+
+    // Build learning context from past successful patterns
+    const learningContext = buildLearningContext({
+      projectName: run.projectName,
+      taskKind: task.kind,
+      taskTitle: task.title,
+      taskPrompt: task.prompt,
+      writeScope: task.writeScope,
+    });
+
+    if (learningContext.appliedPatternIds.length > 0 && onProgress) {
+      await onProgress(`📚 [${task.title}] Injecting ${learningContext.appliedPatternIds.length} learned pattern(s).`);
+    }
+
+    // Run Explorer → Architect pipeline for richer context
+    let architectContext: string | null = null;
+    try {
+      if (onProgress) {
+        await onProgress(`🔍 [${task.title}] Running Explorer → Architect pipeline...`);
+      }
+      const pipeline = await runAgentPipeline({
+        repoPath: taskWorktree.workspace.repoPath,
+        userPrompt: buildScopedTaskPrompt(task, run.prompt, dependencyContext, options),
+        projectTree,
+        projectMemory,
+        projectName: run.projectName,
+        writeScope: task.writeScope,
+        signal: taskSignal,
+        onProgress: onProgress ? (msg) => onProgress(`🤖 [${task.title}] ${msg}`) : undefined,
+        runId: run.id,
+        taskId: task.id,
+      });
+      architectContext = pipeline.implementerContext;
+      if (onProgress) {
+        await onProgress(
+          `📐 [${task.title}] Pipeline complete: ${pipeline.explorationReport.entryPoints.length} entry points, ${pipeline.architectPlan.fileChanges.length} planned changes`,
+        );
+      }
+    } catch (pipelineError: any) {
+      // Pipeline is non-blocking — fall back to direct implementation
+      console.warn(`[unity] Explorer/Architect pipeline failed for task ${task.id}:`, pipelineError.message);
+      if (onProgress) {
+        await onProgress(`⚠️ [${task.title}] Explorer/Architect pipeline skipped, proceeding with direct implementation.`);
+      }
+    }
+
+    // Build baseline failure context so the agent doesn't waste iterations on pre-existing errors
+    const failedBaselineGates = baselineStaticGates.filter((g) => g.status === 'failed');
+    const baselineFailures = failedBaselineGates.length > 0
+      ? failedBaselineGates.map((g) => `- ${g.name}: ${g.details.substring(0, 300)}`).join('\n')
+      : null;
+
     const execution = await generateAndWriteCode({
       repoPath: taskWorktree.workspace.repoPath,
       userPrompt: buildScopedTaskPrompt(task, run.prompt, dependencyContext, options),
@@ -464,7 +584,12 @@ async function executeTask(
       projectTree,
       projectMemory,
       currentDiff: null,
-      signal,
+      learnedPatterns: learningContext.promptSection || null,
+      architectContext,
+      baselineFailures,
+      signal: taskSignal,
+      runId: run.id,
+      taskId: task.id,
       onStatusUpdate: (status, thought) => {
         if (!onProgress) return;
         return onProgress(`🧩 [${task.title}] ${status}${thought ? `\n> ${thought}` : ''}`);
@@ -538,6 +663,40 @@ async function executeTask(
     const status: TaskExecutionOutcome['status'] =
       !commitSha ? 'skipped' : hasFailedGate || !review.approved ? 'failed' : 'succeeded';
 
+    // Learning loop: record outcomes for applied patterns
+    if (learningContext.appliedPatternIds.length > 0) {
+      recordPatternOutcomes({
+        appliedPatternIds: learningContext.appliedPatternIds,
+        taskId: task.id,
+        runId: run.id,
+        succeeded: status === 'succeeded',
+        iterations: execution.iterations || 0,
+        tokensUsed: execution.tokenUsage,
+      });
+    }
+
+    // Learning loop: extract new pattern from successful tasks
+    if (status === 'succeeded' && commitSha) {
+      extractPattern({
+        runId: run.id,
+        taskId: task.id,
+        projectName: run.projectName,
+        taskTitle: task.title,
+        taskKind: task.kind,
+        taskPrompt: task.prompt,
+        writeScope: task.writeScope,
+        iterations: execution.iterations || 0,
+        tokensUsed: execution.tokenUsage,
+        filesRead: execution.filesRead || [],
+        filesEdited: extractEditedFiles(diff),
+        toolHistory: execution.toolHistory || [],
+        commitMessage: execution.commitMessage,
+        gateResults: staticGates.map((g) => ({ name: g.name, status: g.status })),
+      }).catch((err) => {
+        console.warn(`📚 Pattern extraction failed for task ${task.id}:`, err?.message);
+      });
+    }
+
     return {
       task,
       diff,
@@ -556,6 +715,7 @@ async function executeTask(
       },
     };
   } finally {
+    if (taskTimer) clearTimeout(taskTimer);
     await removeTaskWorktree(baseWorkspace.repoPath, taskWorktree.worktreePath);
   }
 }
@@ -570,8 +730,33 @@ async function integrateTaskResult(
   }
 
   await checkoutBranch(baseWorkspace.repoPath, run.branchName);
-  await cherryPickCommit(baseWorkspace.repoPath, executedTask.outcome.commitSha);
-  await pushBranch(baseWorkspace.repoPath, run.branchName);
+
+  const result = await cherryPickCommit(baseWorkspace.repoPath, executedTask.outcome.commitSha);
+
+  if (!result.success) {
+    const detail = result.conflicting
+      ? `Cherry-pick conflict in ${result.conflictFiles.length} file(s): ${result.conflictFiles.join(', ')}`
+      : result.error || 'Cherry-pick failed for unknown reason';
+    throw new Error(detail);
+  }
+
+  if (result.conflicting && result.conflictFiles.length > 0) {
+    console.log(`🔧 Auto-resolved conflicts during integration of task commit: ${result.conflictFiles.join(', ')}`);
+  }
+
+  try {
+    await pushBranch(baseWorkspace.repoPath, run.branchName);
+  } catch (pushError) {
+    // Push failed (e.g. SSL timeout) — revert the cherry-pick to restore clean integration branch
+    // so the next retry attempt starts from a consistent state
+    console.warn(`⚠️ Push failed after cherry-pick, reverting to restore clean state: ${pushError instanceof Error ? pushError.message : String(pushError)}`);
+    try {
+      await execPromise('git reset --hard HEAD~1', { cwd: baseWorkspace.repoPath });
+    } catch (revertError) {
+      console.error('Failed to revert cherry-pick after push failure:', revertError);
+    }
+    throw pushError;
+  }
 }
 
 function createImprovementTasks(
@@ -1223,6 +1408,34 @@ async function executeApprovedRun(
     null,
   );
 
+  // Update Knowledge Graph with file changes from this run
+  try {
+    const knowledgeGraph = getKnowledgeGraph();
+    const changedFiles: Array<{ path: string; taskId?: string; gatePassed: boolean }> = [];
+    for (const task of tasks) {
+      if (task.commitSha) {
+        const taskGatePassed = task.status === 'succeeded';
+        const taskFiles = task.outputSummary
+          ? extractEditedFiles(task.outputSummary)
+          : [];
+        // If no files from summary, use writeScope as proxy
+        const filePaths = taskFiles.length > 0 ? taskFiles : task.writeScope;
+        for (const fp of filePaths) {
+          changedFiles.push({ path: fp, taskId: task.id, gatePassed: taskGatePassed });
+        }
+      }
+    }
+    if (changedFiles.length > 0) {
+      knowledgeGraph.updateAfterRun({
+        projectName: project.name,
+        runId: run.id,
+        changedFiles,
+      });
+    }
+  } catch (kgError) {
+    console.warn('[unity] Knowledge graph update failed:', kgError);
+  }
+
   unityStore.updateRun(run.id, {
     status: closure.status,
     finishedAt: nowIso(),
@@ -1272,6 +1485,13 @@ export async function createAutonomousRunPlan({
   unityStore.upsertPolicy(project.name, policy);
 
   const baseWorkspace = await prepareWorkspace(project);
+
+  // Auto-populate knowledge graph on first run for a project
+  const kg = getKnowledgeGraph();
+  if (kg.listModules(project.name).length === 0) {
+    kg.scanProjectStructure(project.name, baseWorkspace.repoPath);
+  }
+
   const branchState = await ensureIntegrationBranch(baseWorkspace, policy.integrationBranchName);
   const baselineStaticResults = await runStaticGates(baseWorkspace, policy);
   const runId = createEntityId('run');
@@ -1498,6 +1718,13 @@ export async function resumeAutonomousRun({
   unityStore.upsertPolicy(project.name, policy);
 
   const baseWorkspace = await prepareWorkspace(project);
+
+  // Auto-populate knowledge graph on first run for a project
+  const kgResume = getKnowledgeGraph();
+  if (kgResume.listModules(project.name).length === 0) {
+    kgResume.scanProjectStructure(project.name, baseWorkspace.repoPath);
+  }
+
   await ensureIntegrationBranch(baseWorkspace, run.branchName);
   let baselineStaticResults = loadBaselineStaticResults(runId);
   if (baselineStaticResults.length === 0) {
@@ -1512,6 +1739,30 @@ export async function resumeAutonomousRun({
     );
   }
 
+  // ── Checkpoint recovery: reset interrupted tasks ──
+  const isResumeFromCrash = run.status === 'running' || run.status === 'healing';
+  if (isResumeFromCrash) {
+    const resetCount = unityStore.resetInterruptedTasks(run.id);
+    const progress = unityStore.getRunProgress(run.id);
+
+    if (resetCount > 0 || progress.completed > 0) {
+      unityStore.addEvent(
+        createEntityId('event'),
+        run.id,
+        null,
+        'info',
+        'run.checkpoint_resume',
+        `Resuming from checkpoint: ${progress.completed} tasks already completed, ${resetCount} interrupted tasks reset to pending, ${progress.pending} tasks remaining.`,
+      );
+
+      if (onProgress) {
+        await onProgress(
+          `🔄 Resuming from checkpoint: ${progress.completed} tasks done, ${resetCount} reset, ${progress.pending} remaining.`,
+        );
+      }
+    }
+  }
+
   unityStore.updateRun(run.id, {
     status: 'running',
     finishedAt: null,
@@ -1522,7 +1773,7 @@ export async function resumeAutonomousRun({
     null,
     'info',
     'run.resumed',
-    'Run resumed after plan approval.',
+    isResumeFromCrash ? 'Run resumed from crash checkpoint.' : 'Run resumed after plan approval.',
   );
 
   if (onProgress) {
@@ -1539,6 +1790,25 @@ export async function resumeAutonomousRun({
     signal,
     onProgress,
   );
+}
+
+/**
+ * Scan for runs that were interrupted by a crash and can be resumed.
+ */
+export function listResumableRuns(): Array<{
+  runId: string;
+  projectName: string;
+  prompt: string;
+  progress: { total: number; completed: number; failed: number; pending: number };
+}> {
+  const runs = unityStore.listResumableRuns();
+
+  return runs.map((run) => ({
+    runId: run.id,
+    projectName: run.projectName,
+    prompt: run.prompt,
+    progress: unityStore.getRunProgress(run.id),
+  }));
 }
 
 export async function runAutonomousAgent(
