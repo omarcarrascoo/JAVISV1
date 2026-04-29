@@ -10,7 +10,13 @@
 import type { AgentRole } from './model-router.js';
 import { getModelConfig } from './model-router.js';
 import { resolveProvider } from './providers/provider-registry.js';
-import type { LLMCompletionRequest, LLMCompletionResponse, LLMMessage, LLMToolDefinition } from './providers/types.js';
+import type {
+  LLMCompletionRequest,
+  LLMCompletionResponse,
+  LLMMessage,
+  LLMToolDefinition,
+  ReasoningEffort,
+} from './providers/types.js';
 import { getTokenTracker } from './token-tracker.js';
 
 export interface RoleCompletionRequest {
@@ -22,6 +28,10 @@ export interface RoleCompletionRequest {
   temperature?: number;
   /** Override max tokens for this specific call */
   maxTokens?: number;
+  /** Override the role's default thinking toggle for this specific call */
+  thinking?: boolean;
+  /** Override the role's default reasoning effort for this specific call */
+  reasoningEffort?: ReasoningEffort;
   /** For token tracking */
   runId?: string;
   taskId?: string;
@@ -46,6 +56,8 @@ export async function roleCompletion(
     tools: request.tools,
     responseFormat: request.responseFormat,
     signal: request.signal,
+    thinking: request.thinking ?? config.thinking,
+    reasoningEffort: request.reasoningEffort ?? config.reasoningEffort,
   };
 
   const response = await provider.complete(llmRequest);

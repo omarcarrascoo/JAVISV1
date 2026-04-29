@@ -67,6 +67,7 @@ export async function generateAndWriteCode({
     const response = await roleCompletion('code-gen', {
       messages,
       tools: enforceJsonOnly ? undefined : (toolRuntime.tools as any),
+      ...(enforceJsonOnly ? { responseFormat: { type: 'json_object' as const } } : {}),
       signal,
       runId,
       taskId,
@@ -77,11 +78,18 @@ export async function generateAndWriteCode({
     const agentContent = response.content?.trim() || '';
     const agentToolCalls = response.toolCalls;
 
-    // Reconstruct assistant message for conversation history
+    // Reconstruct assistant message for conversation history.
+    // DeepSeek requires reasoning_content to be echoed verbatim on EVERY
+    // thinking-mode assistant turn in subsequent requests — including empty
+    // strings and including turns that did NOT produce tool calls. Omitting
+    // it on any such turn triggers a 400 once that turn is part of history.
     const assistantMessage: LLMMessage = {
       role: 'assistant',
       content: agentContent,
       ...(agentToolCalls.length ? { tool_calls: agentToolCalls } : {}),
+      ...(typeof response.reasoningContent === 'string'
+        ? { reasoning_content: response.reasoningContent }
+        : {}),
     };
     messages.push(assistantMessage);
 
@@ -274,8 +282,11 @@ Generate the smallest corrective JSON patch.`,
       if ((finalResult.edits || []).length === 0) {
         const diffAfterValidation = await getCurrentGitDiff(repoPath);
         const hasUnexpectedDiff = diffAfterValidation.trim() !== '' && !currentDiff?.trim();
+        const wroteViaTool = toolHistory.some(
+          (entry) => entry.startsWith('write_file:') || entry.startsWith('apply_diff:'),
+        );
 
-        if (hasUnexpectedDiff) {
+        if (hasUnexpectedDiff && !wroteViaTool) {
           messages.push({
             role: 'user',
             content: `🚨 RESULT CONSISTENCY ERROR 🚨
@@ -290,6 +301,10 @@ Return a corrected JSON that reflects the actual changes needed from the CURRENT
           }
           finalResult = null;
           continue;
+        }
+
+        if (hasUnexpectedDiff && wroteViaTool && onStatusUpdate) {
+          onStatusUpdate('✅ Accepted edits:[] — repository changes already applied via write_file/apply_diff.');
         }
       }
 

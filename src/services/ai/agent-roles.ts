@@ -249,6 +249,9 @@ export async function runExplorerAgent(params: {
       role: 'assistant',
       content,
       ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+      ...(toolCalls.length && typeof response.reasoningContent === 'string'
+        ? { reasoning_content: response.reasoningContent }
+        : {}),
     });
 
     if (toolCalls.length) {

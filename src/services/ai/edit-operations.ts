@@ -203,6 +203,18 @@ export function applyEditsToFiles(repoPath: string, edits: FileEdit[]): string[]
   for (const edit of edits) {
     if (!edit.filepath) continue;
 
+    if (
+      typeof edit.search === 'string' &&
+      typeof edit.replace === 'string' &&
+      edit.search.length > 0 &&
+      edit.search === edit.replace
+    ) {
+      patchErrors.push(
+        `⚠️ Error in ${edit.filepath}: No-op edit (search === replace). If the file is already correct, return "edits": [] instead.`,
+      );
+      break;
+    }
+
     const fullPath = resolveSafeFilePath(repoPath, edit.filepath);
     const dir = path.dirname(fullPath);
 

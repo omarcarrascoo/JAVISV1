@@ -49,6 +49,8 @@ export interface TaskCostEntry {
 
 /** Approximate costs per 1M tokens (input/output averaged). */
 const MODEL_COST_PER_1M: Record<string, number> = {
+  'deepseek-v4-pro': 2.19,
+  // Legacy entries kept so historical telemetry rows still resolve a cost.
   'deepseek-reasoner': 2.19,
   'deepseek-chat': 0.27,
   'claude-opus-4': 75.0,

@@ -142,5 +142,9 @@ FINAL OUTPUT CONTRACT (STRICT)
   ]
 }
 - If creating a NEW file, leave "search" empty.
+- If you have ALREADY written the complete file contents during this iteration via the
+  'write_file' or 'apply_diff' tools, return "edits": [] in the final JSON. Do NOT
+  duplicate those changes as search/replace edits — that causes no-op patches and loops.
+- NEVER emit an edit whose "search" and "replace" are identical. That is a no-op and is rejected.
   `;
 }

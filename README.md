@@ -121,7 +121,7 @@ Notas del flujo autonomo:
 ### Servicios de IA
 
 - `src/services/ai/agent-runner.ts`
-  Loop principal de generacion de codigo con herramientas, aplicacion de parches y autocorreccion. Usa `deepseek-reasoner` para la fase principal de edicion.
+  Loop principal de generacion de codigo con herramientas, aplicacion de parches y autocorreccion. Usa `deepseek-v4-pro` con thinking mode (`reasoning_effort: max`) para la fase principal de edicion.
 
 - `src/services/ai/client.ts`
   Cliente DeepSeek con retry de red.
@@ -130,7 +130,7 @@ Notas del flujo autonomo:
   Genera metadata de PR/commit message a partir del diff final.
 
 - `src/services/orchestration/planner.ts` y `src/services/orchestration/reviewer.ts`
-  Usan `deepseek-chat` para planning y revision estructurada.
+  Usan `deepseek-v4-pro` con thinking mode deshabilitado (modo chat) para planning y revision estructurada.
 
 ### Orquestacion autonoma
 
